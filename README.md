@@ -34,7 +34,7 @@ uboot/
 rootfs/
   rootfs.env               Debian release, mirror, packages, root password
   overlay/                 files on top of Debian (network, USB gadget,
-                           boot partition handling)
+                           boot partition handling, touchscreen firmware)
   build-rootfs.sh          builds the root file system tarball
 image/
   image.env                SD card layout
@@ -172,10 +172,17 @@ from `output/`. Result: `output/rootfs.tar`.
   becomes `/etc/wpa_supplicant/wpa_supplicant.conf`, the keys of an
   `authorized_keys` file are added to `/root/.ssh/authorized_keys`. Both
   files are removed from the boot partition afterwards.
+- **Touchscreen firmware**: the GSL3673 needs
+  `/usr/lib/firmware/silead/gsl3673-denver-frame.fw` (from the stock
+  Android image), otherwise `silead_ts` does not probe.
 - **USB gadget**: serial console (`ttyGS0`) and Ethernet `usb0` with the
   static address of `interfaces.d/usb0` (10.23.99.5/16).
 - **First boot**: the root partition grows to the size of the card, SSH
   host keys and the machine ID are generated (the image has none).
+- **No age-based cleanup of `/tmp`** (`/etc/tmpfiles.d/tmp.conf`): without
+  an RTC the frame boots with a clock months in the past, after the NTP
+  jump the cleanup would delete everything created at boot (e.g.
+  `/tmp/.X11-unix`, Xwayland then fails for non-root users).
 - Root login (also via SSH) with the password from `rootfs.env`.
 - The eMMC (stock Android) is kept read-only by a udev rule.
 
