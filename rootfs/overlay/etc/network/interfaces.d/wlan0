@@ -1,0 +1,6 @@
+# WiFi (RK915). The network is configured in
+# /etc/wpa_supplicant/wpa_supplicant.conf, which can also be put on the boot
+# partition as wpa_supplicant.conf (moved into place at boot).
+allow-hotplug wlan0
+iface wlan0 inet dhcp
+	wpa-conf /etc/wpa_supplicant/wpa_supplicant.conf

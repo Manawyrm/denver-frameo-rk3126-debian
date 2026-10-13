@@ -1,0 +1,37 @@
+#!/bin/sh
+# Called by the kernel package after installation (version, image path):
+# copy the kernel and the device trees to the FAT boot partition, where
+# U-Boot loads them from (see uEnv.txt there).
+
+set -e
+
+version=$1
+image=${2:-/boot/vmlinuz-$version}
+boot=/boot/firmware
+
+if [ ! -d "$boot" ]
+then
+	echo "zz-frame-boot-partition: $boot missing, boot partition not updated" >&2
+	exit 0
+fi
+
+# On the running frame the boot partition has to be mounted, otherwise the
+# files would end up hidden on the root file system. During the image build
+# (FRAME_IMAGE_BUILD=1) it is a plain directory that becomes the FAT
+# partition.
+if [ "${FRAME_IMAGE_BUILD:-}" != 1 ] && ! mountpoint -q "$boot"
+then
+	echo "zz-frame-boot-partition: $boot is not mounted, boot partition not updated" >&2
+	exit 0
+fi
+
+echo "zz-frame-boot-partition: installing $version to $boot"
+cp "$image" "$boot/zImage.new"
+mv "$boot/zImage.new" "$boot/zImage"
+for dtb in /usr/lib/linux-image-"$version"/rk3126-denver-frame*.dtb
+do
+	cp "$dtb" "$boot/$(basename "$dtb").new"
+	mv "$boot/$(basename "$dtb").new" "$boot/$(basename "$dtb")"
+done
+echo "$version" > "$boot/kernel-version"
+sync

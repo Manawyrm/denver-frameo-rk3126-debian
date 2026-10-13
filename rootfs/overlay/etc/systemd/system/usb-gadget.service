@@ -1,0 +1,15 @@
+[Unit]
+Description=USB gadget: serial console and Ethernet on the OTG port
+After=sys-kernel-config.mount
+Requires=sys-kernel-config.mount
+Before=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/usb-gadget start
+ExecStop=/usr/local/sbin/usb-gadget stop
+
+[Install]
+WantedBy=multi-user.target

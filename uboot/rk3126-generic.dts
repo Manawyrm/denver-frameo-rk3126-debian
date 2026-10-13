@@ -1,0 +1,87 @@
+// SPDX-License-Identifier: GPL-2.0+
+/*
+ * Generic RK3126/RK3128 board for U-Boot, booting from SD card.
+ *
+ * The debug UART (UART2, GPIO1_C2/GPIO1_C3) shares its pins with
+ * SDMMC_D0/SDMMC_D1. To keep the console usable, the SD controller only
+ * claims CLK/CMD/DET here and runs in 1-bit mode. The boot command switches
+ * GPIO1_C2 to SDMMC_D0 while loading files and back to UART2_TX afterwards.
+ */
+
+/dts-v1/;
+
+#include "rk3128.dtsi"
+
+/ {
+	model = "Generic RK3126 (SD boot)";
+	compatible = "rockchip,rk3126-generic", "rockchip,rk3128";
+
+	aliases {
+		mmc0 = &emmc;
+		mmc1 = &sdmmc;
+	};
+
+	chosen {
+		stdout-path = &uart2;
+	};
+
+	memory@60000000 {
+		device_type = "memory";
+		reg = <0x60000000 0x40000000>;
+	};
+
+	/*
+	 * Not in rk3128.dtsi. U-Boot reads the CPU ID from it (offset 0x7)
+	 * and derives the ethaddr MAC address from it, which it writes into
+	 * the node of the ethernet0 alias of the kernel device tree.
+	 */
+	efuse: efuse@20090000 {
+		compatible = "rockchip,rk3128-efuse";
+		reg = <0x20090000 0x20>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+	};
+};
+
+/*
+ * The RK3126/RK3128 MMC controllers have no internal DMA engine (HCON
+ * transfer mode 1, Linux uses the external PL330). U-Boot would use the
+ * internal one and wait forever for the data, so use PIO (fifo-mode).
+ *
+ * No pinctrl for the eMMC: RK3126 and RK3128 route EMMC_CMD to different
+ * pins (GPIO1_C6 or GPIO2_A4). The Rockchip loader has already set up the
+ * correct routing for this board, so we keep it.
+ */
+&emmc {
+	bus-width = <8>;
+	cap-mmc-highspeed;
+	fifo-mode;
+	non-removable;
+	status = "okay";
+};
+
+&sdmmc {
+	bus-width = <1>;
+	fifo-mode;
+	disable-wp;
+	pinctrl-names = "default";
+	pinctrl-0 = <&sdmmc_clk &sdmmc_cmd &sdmmc_det>;
+	status = "okay";
+};
+
+&uart2 {
+	status = "okay";
+};
+
+&usb2phy {
+	status = "okay";
+};
+
+&usb2phy_otg {
+	status = "okay";
+};
+
+&usb_otg {
+	dr_mode = "peripheral";
+	status = "okay";
+};

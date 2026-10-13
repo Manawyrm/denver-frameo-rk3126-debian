@@ -1,0 +1,14 @@
+# Boot settings, read by U-Boot from the boot partition.
+# Only "name=value" lines, lines starting with # are ignored.
+
+# Kernel and device tree on this partition (copied here by the kernel
+# package, see /etc/kernel/postinst.d/zz-frame-boot-partition)
+kernelfile=zImage
+rootfdtfile=rk3126-denver-frame-sdroot.dtb
+
+# Root file system: second partition of the SD card
+rootdev=/dev/mmcblk1p2
+
+# Additional kernel arguments, e.g. "usbspeed=full" if USB transfers to the
+# PC fail (the USB-C port only has data lines in one plug orientation)
+bootargs_extra=

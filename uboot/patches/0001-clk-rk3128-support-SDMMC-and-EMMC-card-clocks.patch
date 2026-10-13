@@ -1,0 +1,51 @@
+From: picture-frame build
+Subject: [PATCH] clk: rk3128: support the SDMMC and EMMC card clocks
+
+The dw_mmc driver sets the rate of the "ciu" clock (SCLK_SDMMC,
+SCLK_EMMC). Without it the card clock is never set up and both
+controllers fail with "Card did not respond to voltage select".
+The card clock dividers are 6 bits wide, so switch to the 24 MHz
+source above a divider of 64.
+---
+diff --git a/drivers/clk/rockchip/clk_rk3128.c b/drivers/clk/rockchip/clk_rk3128.c
+index a0728559..acf21459 100644
+--- a/drivers/clk/rockchip/clk_rk3128.c
++++ b/drivers/clk/rockchip/clk_rk3128.c
+@@ -317,7 +317,7 @@ static ulong rockchip_mmc_set_clk(struct rk3128_cru *cru, uint clk_general_rate,
+ 	/* mmc clock defaulg div 2 internal, need provide double in cru */
+ 	src_clk_div = DIV_ROUND_UP(clk_general_rate / 2, freq);
+ 
+-	if (src_clk_div > 128) {
++	if (src_clk_div > 64) {
+ 		src_clk_div = DIV_ROUND_UP(OSC_HZ / 2, freq);
+ 		mux = EMMC_SEL_24M;
+ 	} else {
+@@ -326,6 +326,7 @@ static ulong rockchip_mmc_set_clk(struct rk3128_cru *cru, uint clk_general_rate,
+ 
+ 	switch (periph) {
+ 	case HCLK_EMMC:
++	case SCLK_EMMC:
+ 		rk_clrsetreg(&cru->cru_clksel_con[12],
+ 			     EMMC_PLL_MASK | EMMC_DIV_MASK,
+ 			     mux << EMMC_PLL_SHIFT |
+@@ -495,6 +496,11 @@ static ulong rk3128_clk_get_rate(struct clk *clk)
+ 		return rk3128_peri_get_pclk(priv->cru, clk->id);
+ 	case SCLK_SARADC:
+ 		return rk3128_saradc_get_clk(priv->cru);
++	case SCLK_SDMMC:
++	case SCLK_EMMC:
++		return rockchip_mmc_get_clk(priv->cru,
++					    rkclk_pll_get_rate(priv->cru, CLK_GENERAL),
++					    clk->id);
+ 	case DCLK_VOP:
+ 	case ACLK_VIO0:
+ 	case ACLK_VIO1:
+@@ -520,6 +526,8 @@ static ulong rk3128_clk_set_rate(struct clk *clk, ulong rate)
+ 					      clk->id, rate);
+ 		break;
+ 	case HCLK_EMMC:
++	case SCLK_SDMMC:
++	case SCLK_EMMC:
+ 		new_rate = rockchip_mmc_set_clk(priv->cru, gclk_rate,
+ 						clk->id, rate);
+ 		break;

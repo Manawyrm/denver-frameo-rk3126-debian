@@ -1,0 +1,13 @@
+[Unit]
+Description=Grow the root partition to the size of the SD card (first boot)
+ConditionPathExists=!/var/lib/growroot.done
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=-/usr/bin/growpart /dev/mmcblk1 2
+ExecStart=/usr/sbin/resize2fs /dev/mmcblk1p2
+ExecStart=/usr/bin/touch /var/lib/growroot.done
+
+[Install]
+WantedBy=multi-user.target

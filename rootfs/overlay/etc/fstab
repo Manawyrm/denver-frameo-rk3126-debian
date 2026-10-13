@@ -1,0 +1,5 @@
+# Root file system: second partition of the SD card
+/dev/mmcblk1p2	/		ext4	defaults,noatime	0	1
+# Boot partition (FAT32): kernel, device trees and uEnv.txt for U-Boot,
+# updated by /etc/kernel/postinst.d/zz-frame-boot-partition
+/dev/mmcblk1p1	/boot/firmware	vfat	defaults,noatime	0	2

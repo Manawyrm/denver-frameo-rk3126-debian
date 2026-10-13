@@ -1,0 +1,3 @@
+# The eMMC still holds the stock Android firmware: keep all of its block
+# devices (user area, boot partitions) read-only.
+SUBSYSTEM=="block", KERNEL=="mmcblk0*", ACTION=="add", RUN+="/usr/sbin/blockdev --setro /dev/%k"
