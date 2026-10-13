@@ -193,7 +193,8 @@ image/build-image.sh
 | partition 2, 1.5 GiB | ext4 `rootfs`, grows on the first boot |
 
 `mke2fs -d` builds the ext4 file system straight from the tarball (owners
-and permissions included, no root needed), `mtools` the FAT partition.
+and permissions included, no root needed; it loads `libarchive13t64` at
+run time), `mtools` the FAT partition.
 Result: `output/sdcard.img` and `output/sdcard.img.bmap`:
 
 ```
@@ -210,7 +211,8 @@ apt-get update
 apt-get install gcc-arm-linux-gnueabihf make bc bison flex perl rsync cpio \
 	dpkg-dev debhelper fakeroot kmod xz-utils curl ca-certificates git python3 \
 	libssl-dev libelf-dev libdw-dev libssl-dev:armhf \
-	mmdebstrap arch-test uidmap e2fsprogs dosfstools mtools fdisk bmap-tools
+	mmdebstrap arch-test uidmap e2fsprogs libarchive13t64 dosfstools mtools \
+	fdisk bmap-tools
 ```
 
 `rootfs/build-rootfs.sh` needs user namespaces with subuids for the build

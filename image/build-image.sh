@@ -81,7 +81,9 @@ build_root_partition()
 		tar --delete -f "$WORK/root.tar" $members
 	fi
 
-	E2FSPROGS_FAKE_TIME=$SOURCE_DATE_EPOCH mke2fs -q -t ext4 -L rootfs \
+	# libarchive refuses non-ASCII file names in the tarball unless the
+	# locale is UTF-8 (C.UTF-8 is built into glibc, always available)
+	LC_ALL=C.UTF-8 E2FSPROGS_FAKE_TIME=$SOURCE_DATE_EPOCH mke2fs -q -t ext4 -L rootfs \
 		-U "$ROOT_UUID" -E "hash_seed=$ROOT_UUID" \
 		-d "$WORK/root.tar" "$WORK/root.ext4" "${ROOT_SIZE_MB}M"
 	rm "$WORK/root.tar"

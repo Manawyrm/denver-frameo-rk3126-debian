@@ -25,7 +25,8 @@ PACKAGES="
 	gcc-arm-linux-gnueabihf make bc bison flex perl rsync cpio
 	dpkg-dev debhelper fakeroot kmod xz-utils curl ca-certificates git python3
 	libssl-dev libelf-dev libdw-dev libssl-dev:armhf
-	mmdebstrap arch-test uidmap e2fsprogs dosfstools mtools fdisk bmap-tools
+	mmdebstrap arch-test uidmap e2fsprogs libarchive13t64 dosfstools mtools fdisk
+	bmap-tools
 "
 
 install_packages()
@@ -42,9 +43,10 @@ install_packages()
 	apt-get update -qq
 	DEBIAN_FRONTEND=noninteractive apt-get install -yqq $packages
 
-	# The checkout belongs to the runner user, not to root: without this git
-	# refuses to work in it (and SOURCE_DATE_EPOCH would fall back to now)
-	git config --global --add safe.directory "$TOP"
+	# The checkout (and a restored download cache) belongs to the runner
+	# user, not to root: without this git refuses to work in it (and
+	# SOURCE_DATE_EPOCH would fall back to now)
+	git config --global --add safe.directory "*"
 }
 
 pack_release()
