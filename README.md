@@ -51,6 +51,8 @@ rootfs/build-rootfs.sh     # needs the packages of the three above
 image/build-image.sh
 ```
 
+`./build.sh` runs all five in this order.
+
 Settings for all scripts via the environment: `BUILD_DIR`, `OUTPUT_DIR`,
 `DOWNLOAD_DIR`, `JOBS`, `CROSS_COMPILE`, `SOURCE_DATE_EPOCH` (default: the
 last commit, so every build of a commit is the same).
@@ -206,9 +208,9 @@ Debian 13 (trixie), any architecture, with armhf as foreign architecture:
 dpkg --add-architecture armhf
 apt-get update
 apt-get install gcc-arm-linux-gnueabihf make bc bison flex perl rsync cpio \
-	dpkg-dev debhelper fakeroot kmod xz-utils curl git python3 \
+	dpkg-dev debhelper fakeroot kmod xz-utils curl ca-certificates git python3 \
 	libssl-dev libelf-dev libdw-dev libssl-dev:armhf \
-	mmdebstrap uidmap e2fsprogs dosfstools mtools fdisk bmap-tools
+	mmdebstrap arch-test uidmap e2fsprogs dosfstools mtools fdisk bmap-tools
 ```
 
 `rootfs/build-rootfs.sh` needs user namespaces with subuids for the build
@@ -218,3 +220,13 @@ user (`/etc/subuid`, `/etc/subgid`) or root.
 On build hosts other than ARM also `qemu-user-binfmt` (to run armhf
 programs in the root file system), on build hosts other than x86-64
 `qemu-user` and `libc6-amd64-cross` (for `loaderimage`).
+
+## CI
+
+`.github/workflows/main.yml` builds the image on GitHub (new branches and
+tags, pull requests): on an Ubuntu runner with `qemu-user-static` (binfmt
+for armhf) it runs `scripts/ci-build.sh` as root in a `debian:trixie`
+container. That script installs the build host packages above, runs
+`./build.sh` and packs `release/`: the xz-compressed image, its bmap and
+the release notes (`version-info`). For a tag these become a GitHub
+release.

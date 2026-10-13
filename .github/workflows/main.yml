@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  create: { }
+  pull_request: { }
+
+permissions:
+  contents: write
+
+jobs:
+  image:
+    runs-on: [ubuntu-24.04]
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt update -qq
+          sudo apt install -yqq qemu-user-static binfmt-support
+
+      - name: Build image
+        run: |
+          docker run --rm --privileged -v "$PWD:/src" -w /src debian:trixie scripts/ci-build.sh
+
+      - name: Release build artifacts
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          append_body: true
+          body_path: ./release/version-info
+          files: |
+            ./release/*.img.xz
+            ./release/*.img.bmap
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
