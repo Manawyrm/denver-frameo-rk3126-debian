@@ -57,6 +57,17 @@ Run `screen /dev/ttyACM0 115200` on a computer connected to the USB-C port of th
 
 # USB device mode features
 
+> [!WARNING]
+> **Bad USB-C implementation:** The hardware design seems to be severely flawed.  
+> The USB-C CC resistors are missing, so some devices (like MacBooks) will never try to talk to the picture frame.
+> Use a USB-C -> USB-A and USB-A -> USB-C adapter or cable chain.
+>
+> **Orientation matters!** Because they also messed up the D+/D- data lines communication might only work with the USB-C plug in one direction.
+> If you're having trouble enumerating the USB device, flip the USB-C plug (on the tablet side!).
+>
+> **Bad signal integrity** USB 2.0/480 MBit/s wasn't reliable against my Apple Silicon Mac, but worked against a Intel 10th Gen platform.
+> Try another computer or downgrade the tablet to USB 1.1/12MBit/s if you're having issues.
+
 The picture frame has full USB peripheral support and will expose itself as a USB serial port and a USB Ethernet adapter:
 
 ```
