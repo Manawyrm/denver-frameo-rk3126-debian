@@ -6,8 +6,8 @@
 #
 #   1. Install the build host packages (README.md, "Build host")
 #   2. ./build.sh
-#   3. Release files in release/: the xz-compressed SD card image, its bmap
-#      and version-info (text for the release notes)
+#   3. Release files in release/: the xz-compressed SD card and eMMC
+#      images, their bmaps and version-info (text for the release notes)
 #
 # Usage: scripts/ci-build.sh
 #
@@ -63,15 +63,23 @@ pack_release()
 	log "Release files $name"
 	rm -rf "$RELEASE_DIR"
 	mkdir -p "$RELEASE_DIR"
-	xz -T0 -c "$OUTPUT_DIR/sdcard.img" > "$RELEASE_DIR/$name.img.xz"
-	cp "$OUTPUT_DIR/sdcard.img.bmap" "$RELEASE_DIR/$name.img.bmap"
+	for img in sdcard emmc
+	do
+		xz -T0 -c "$OUTPUT_DIR/$img.img" > "$RELEASE_DIR/$name-$img.img.xz"
+		cp "$OUTPUT_DIR/$img.img.bmap" "$RELEASE_DIR/$name-$img.img.bmap"
+	done
 
 	cat > "$RELEASE_DIR/version-info" <<-EOF
 		Debian $DEBIAN_SUITE armhf for the Denver Frameo picture frame (RK3126B):
 		kernel $LINUX_VERSION$LINUX_LOCALVERSION, U-Boot $UBOOT_VERSION, RK915 driver $RK915_VERSION.
 
-		Write it to an SD card (2 GB or more) with
-		\`bmaptool copy $name.img.xz /dev/sdX\` (uses the .bmap next to it).
+		\`$name-sdcard.img.xz\`: write it to an SD card (2 GB or more) with
+		\`bmaptool copy $name-sdcard.img.xz /dev/sdX\` (uses the .bmap next to it).
+		\`$name-emmc.img.xz\`: the same system for the internal eMMC (replaces the
+		stock Android). For example from the SD card system, which keeps the eMMC
+		read-only: \`blockdev --setrw /dev/mmcblk0\`, then
+		\`xzcat $name-emmc.img.xz | dd of=/dev/mmcblk0 bs=4M\`.
+		U-Boot boots from a bootable SD card first, then from the eMMC.
 		A \`wpa_supplicant.conf\` and an \`authorized_keys\` file on the FAT
 		partition are taken over on boot. Login: root / $ROOT_PASSWORD
 	EOF

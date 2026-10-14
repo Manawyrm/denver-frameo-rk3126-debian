@@ -3,10 +3,13 @@
 
 # Kernel and device tree on this partition (copied here by the kernel
 # package, see /etc/kernel/postinst.d/zz-frame-boot-partition)
+# SD card: rk3126-denver-frame-sdroot.dtb (gives the shared SDMMC_D0/UART2_TX
+# pin to the SD card), eMMC: rk3126-denver-frame.dtb (keeps the UART)
 kernelfile=zImage
 rootfdtfile=rk3126-denver-frame-sdroot.dtb
 
-# Root file system: second partition of the SD card
+# Root file system: second partition of the boot medium (SD card: mmcblk1,
+# eMMC: mmcblk0)
 rootdev=/dev/mmcblk1p2
 
 # Additional kernel arguments, e.g. "usbspeed=full" if USB transfers to the

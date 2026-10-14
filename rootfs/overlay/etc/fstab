@@ -1,4 +1,5 @@
-# Root file system: second partition of the SD card
+# Root file system: second partition of the boot medium. mmcblk1 is the SD
+# card; image/build-image.sh replaces it with mmcblk0 in the eMMC image.
 /dev/mmcblk1p2	/		ext4	defaults,noatime	0	1
 # Boot partition (FAT32): kernel, device trees and uEnv.txt for U-Boot,
 # updated by /etc/kernel/postinst.d/zz-frame-boot-partition

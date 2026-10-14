@@ -1,5 +1,5 @@
 [Unit]
-Description=Grow the root partition to the size of the SD card (first boot)
+Description=Grow the root partition to the size of the boot medium (first boot)
 ConditionPathExists=!/var/lib/growroot.done
 After=local-fs.target
 

@@ -3,8 +3,8 @@
 Reproducible build of the software for the Denver Frameo picture frame
 ("F606C" board, Rockchip RK3126B, 800x1280 MIPI DSI panel, GSL3673 touch,
 RK915 WiFi), meant to run unattended in CI: kernel, WiFi driver, boot
-loader, a Debian 13 root file system and the SD card image, all without root
-privileges.
+loader, a Debian 13 root file system and the images for the SD card and the
+internal eMMC, all without root privileges.
 
 ## Layout
 
@@ -37,8 +37,8 @@ rootfs/
                            boot partition handling, touchscreen firmware)
   build-rootfs.sh          builds the root file system tarball
 image/
-  image.env                SD card layout
-  build-image.sh           assembles the SD card image
+  image.env                image layout
+  build-image.sh           assembles the SD card or eMMC image
 ```
 
 Build order:
@@ -48,10 +48,11 @@ kernel/build-kernel.sh
 rk915/build-rk915.sh       # needs the kernel tree
 uboot/build-uboot.sh
 rootfs/build-rootfs.sh     # needs the packages of the three above
-image/build-image.sh
+image/build-image.sh sd    # SD card image
+image/build-image.sh emmc  # eMMC image
 ```
 
-`./build.sh` runs all five in this order.
+`./build.sh` runs all of them in this order.
 
 Settings for all scripts via the environment: `BUILD_DIR`, `OUTPUT_DIR`,
 `DOWNLOAD_DIR`, `JOBS`, `CROSS_COMPILE`, `SOURCE_DATE_EPOCH` (default: the
@@ -143,7 +144,9 @@ BootROM -> Rockchip DDR init + miniloader -> U-Boot. `loaderimage` only
 exists as an x86-64 binary; on other build hosts it runs through
 qemu-user. The boot environment (`uboot/config/rk3126-sdboot.env`) loads
 the kernel from the FAT boot partition (`uEnv.txt`, rescue initramfs or
-Debian with `rootdev`).
+Debian with `rootdev`), first from the SD card (`sdboot`), then from the
+eMMC (`emmcboot`). A bootable SD card always wins, so it is also the way
+back from a broken eMMC installation.
 
 Raise `UBOOT_PKG_REVISION` in `uboot/uboot.env` whenever patches, device
 tree, config or environment change.
@@ -184,13 +187,17 @@ from `output/`. Result: `output/rootfs.tar`.
   jump the cleanup would delete everything created at boot (e.g.
   `/tmp/.X11-unix`, Xwayland then fails for non-root users).
 - Root login (also via SSH) with the password from `rootfs.env`.
-- The eMMC (stock Android) is kept read-only by a udev rule.
+- The eMMC (stock Android) is kept read-only by a udev rule (only in the SD
+  card image).
 
-## SD card image
+## SD card and eMMC image
 
 ```
-image/build-image.sh
+image/build-image.sh sd
+image/build-image.sh emmc
 ```
+
+Both images contain the same root file system and boot loader:
 
 | Where | What |
 |---|---|
@@ -199,14 +206,33 @@ image/build-image.sh
 | partition 1, 16 MiB, 256 MiB | FAT32 `BOOT`: kernel, device trees, `uEnv.txt` |
 | partition 2, 1.5 GiB | ext4 `rootfs`, grows on the first boot |
 
+They differ in where the root file system is (`uEnv.txt`, `/etc/fstab`,
+`growroot.service`), the device tree and the IDs of disk and file systems:
+
+| | `sd` | `emmc` |
+|---|---|---|
+| Result | `output/sdcard.img` | `output/emmc.img` |
+| Root | `/dev/mmcblk1p2` | `/dev/mmcblk0p2` |
+| Device tree | `rk3126-denver-frame-sdroot.dtb`: the SD card gets the SDMMC_D0 pin shared with UART2_TX, no serial console under Linux | `rk3126-denver-frame.dtb`: UART2 works, the SD card is only usable in U-Boot |
+| eMMC | read-only (udev rule) | root file system |
+
 `mke2fs -d` builds the ext4 file system straight from the tarball (owners
 and permissions included, no root needed; it loads `libarchive13t64` at
-run time), `mtools` the FAT partition.
-Result: `output/sdcard.img` and `output/sdcard.img.bmap`:
+run time), `mtools` the FAT partition. Each image comes with a `.bmap`:
 
 ```
 bmaptool copy output/sdcard.img /dev/sdX
 ```
+
+The eMMC image replaces the stock Android firmware. One way to install it:
+boot the SD card image, then
+
+```
+blockdev --setrw /dev/mmcblk0
+xzcat emmc.img.xz | dd of=/dev/mmcblk0 bs=4M
+```
+
+and reboot without the SD card.
 
 ## Build host
 
@@ -236,6 +262,6 @@ programs in the root file system), on build hosts other than x86-64
 tags, pull requests): on an Ubuntu runner with `qemu-user-static` (binfmt
 for armhf) it runs `scripts/ci-build.sh` as root in a `debian:trixie`
 container. That script installs the build host packages above, runs
-`./build.sh` and packs `release/`: the xz-compressed image, its bmap and
-the release notes (`version-info`). For a tag these become a GitHub
+`./build.sh` and packs `release/`: the xz-compressed SD card and eMMC
+images, their bmaps and the release notes (`version-info`). For a tag these become a GitHub
 release.
