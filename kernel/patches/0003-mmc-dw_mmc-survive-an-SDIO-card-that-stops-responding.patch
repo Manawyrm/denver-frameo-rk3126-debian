@@ -11,10 +11,12 @@ docs/mainline-linux-7.1-dw_mmc-sdio-robustness.patch):
 Changed here: the write timeout is only armed for SDIO cards. It covers
 the whole transfer but is sized from the per-access data timeout, and
 the root filesystem of the frame is on an SD card on the same driver.
+The masking is only a debug message: a stray TXDR follows every normal
+PIO write, with the RK915 dozens of times per second.
 ---
 --- a/drivers/mmc/host/dw_mmc.c
 +++ b/drivers/mmc/host/dw_mmc.c
-@@ -1553,6 +1553,29 @@
+@@ -1553,6 +1553,33 @@
  	}
  }
  
@@ -24,6 +26,10 @@ the root filesystem of the frame is on an SD card on the same driver.
 + * underlying FIFO condition persists, and the level-triggered line is re-raised
 + * immediately. Mask the bit; dw_mci_submit_data() re-enables it for the next PIO
 + * transfer.
++ *
++ * This also happens at the end of every normal PIO write (TXDR once the last
++ * data has left the FIFO), dozens of times per second with SDIO WiFi, so it is
++ * only a debug message.
 + */
 +static void dw_mci_mask_stuck_fifo_irq(struct dw_mci *host, u32 bit)
 +{
@@ -34,7 +40,7 @@ the root filesystem of the frame is on an SD card on the same driver.
 +	int_mask = mci_readl(host, INTMASK);
 +	if (int_mask & bit) {
 +		mci_writel(host, INTMASK, int_mask & ~bit);
-+		dev_err_ratelimited(host->dev,
++		dev_dbg_ratelimited(host->dev,
 +				    "FIFO irq %#x with no transfer to service; masking\n",
 +				    bit);
 +	}
@@ -44,7 +50,7 @@ the root filesystem of the frame is on an SD card on the same driver.
  static void __dw_mci_enable_sdio_irq(struct dw_mci *host, int enb)
  {
  	unsigned long irqflags;
-@@ -1860,6 +1883,22 @@
+@@ -1860,6 +1887,22 @@
  	return data->error;
  }
  
@@ -67,7 +73,7 @@ the root filesystem of the frame is on an SD card on the same driver.
  static void dw_mci_set_drto(struct dw_mci *host)
  {
  	const struct dw_mci_drv_data *drv_data = host->drv_data;
-@@ -2024,9 +2063,13 @@
+@@ -2024,9 +2067,13 @@
  						&host->pending_events)) {
  				/*
  				 * If all data-related interrupts don't come
@@ -83,7 +89,7 @@ the root filesystem of the frame is on an SD card on the same driver.
  					dw_mci_set_drto(host);
  				break;
  			}
-@@ -2062,11 +2105,11 @@
+@@ -2062,11 +2109,11 @@
  		case STATE_DATA_BUSY:
  			if (!dw_mci_clear_pending_data_complete(host)) {
  				/*
@@ -99,7 +105,7 @@ the root filesystem of the frame is on an SD card on the same driver.
  					dw_mci_set_drto(host);
  				break;
  			}
-@@ -2748,12 +2791,16 @@
+@@ -2748,12 +2795,16 @@
  			mci_writel(host, RINTSTS, SDMMC_INT_RXDR);
  			if (host->dir_status == MMC_DATA_READ && host->sg)
  				dw_mci_read_data_pio(host, false);
