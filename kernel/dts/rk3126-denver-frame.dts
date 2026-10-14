@@ -1,0 +1,452 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Denver Frameo picture frame (RK3126B, "F606C" board by ZhiHeXing).
+ *
+ * Derived from the device tree of the stock Android firmware
+ * (resource partition, rk-kernel.dtb):
+ *
+ *   display     800x1280 MIPI DSI, 4 lanes, JD9365 controller with the
+ *               same init sequence as the Chongzhou CZ101B4001 panel
+ *   backlight   PWM0, 40 kHz
+ *   panel power GPIO0_A2 (active low), GPIO1_B1 (active low),
+ *               reset GPIO2_B0
+ *   touch       GSL3673 on I2C0 0x40, IRQ GPIO2_C3, power GPIO2_C2
+ *   buttons     SARADC channel 2 (volume up/down), power GPIO2_B6
+ *   WiFi        RK915 on SDIO, power GPIO1_B0, wakeup GPIO2_C1
+ *   power off   GPIO2_B5 (power hold, active low = off)
+ *
+ * vdd_arm and vdd_logic come from PWM regulators on PWM1/PWM2, set to the
+ * stock voltages (1.25 V / 1.2 V, no CPU frequency scaling yet).
+ *
+ * UART2 (GPIO1_C2/C3) shares its pins with SDMMC_D0/D1. This device tree
+ * keeps them on the UART (SD card in 1-bit mode without D0, only usable
+ * from U-Boot); rk3126-denver-frame-sdroot.dts gives D0 to the SD card for
+ * a root filesystem on it.
+ */
+
+/dts-v1/;
+
+#include <dt-bindings/input/input.h>
+#include "rk3128.dtsi"
+
+/* The SoC is an RK3126B: a few clock gates differ from the RK3128 */
+&cru {
+	compatible = "rockchip,rk3126-cru";
+};
+
+&cpu0 {
+	cpu-supply = <&vdd_arm>;
+};
+
+/*
+ * vdd_arm cannot go below 1.175 V. The stock firmware ran the CPU at
+ * 816 MHz / 1.15 V and 1008 MHz / 1.2 V. 1200 MHz at 1.325 V (mainline
+ * table) hung the board under load on all four cores, so the stock
+ * maximum is kept. There is no temperature sensor.
+ */
+&cpu_opp_table {
+	opp-216000000 {
+		opp-microvolt = <1175000 1175000 1450000>;
+	};
+	opp-408000000 {
+		opp-microvolt = <1175000 1175000 1450000>;
+	};
+	opp-600000000 {
+		opp-microvolt = <1175000 1175000 1450000>;
+	};
+	opp-696000000 {
+		opp-microvolt = <1175000 1175000 1450000>;
+	};
+	opp-816000000 {
+		opp-microvolt = <1175000 1175000 1450000>;
+	};
+	opp-1008000000 {
+		opp-microvolt = <1200000 1200000 1450000>;
+	};
+	/delete-node/ opp-1200000000;
+};
+
+/ {
+	model = "Denver Frameo picture frame (RK3126)";
+	/* rk3126: the RK915 driver picks its SDIO clock per channel by SoC */
+	compatible = "denver,frameo-rk3126", "rockchip,rk3126", "rockchip,rk3128";
+
+	aliases {
+		mmc0 = &emmc;
+		mmc1 = &sdmmc;
+		mmc2 = &sdio;
+		/* U-Boot writes the MAC address derived from the CPU ID here */
+		ethernet0 = &wifi;
+	};
+
+	chosen {
+		stdout-path = "serial2:115200n8";
+	};
+
+	/* Overwritten by U-Boot with the size detected by the DDR init */
+	memory@60000000 {
+		device_type = "memory";
+		reg = <0x60000000 0x10000000>;
+	};
+
+	adc-keys {
+		compatible = "adc-keys";
+		io-channels = <&saradc 2>;
+		io-channel-names = "buttons";
+		keyup-threshold-microvolt = <1800000>;
+		poll-interval = <100>;
+
+		button-volume-up {
+			label = "Volume Up";
+			linux,code = <KEY_VOLUMEUP>;
+			press-threshold-microvolt = <10000>;
+		};
+
+		button-volume-down {
+			label = "Volume Down";
+			linux,code = <KEY_VOLUMEDOWN>;
+			press-threshold-microvolt = <885000>;
+		};
+	};
+
+	backlight: backlight {
+		compatible = "pwm-backlight";
+		pwms = <&pwm0 0 25000 0>;
+		brightness-levels = <0 255>;
+		num-interpolated-steps = <255>;
+		default-brightness-level = <128>;
+	};
+
+	gpio-keys {
+		compatible = "gpio-keys";
+
+		button-power {
+			label = "Power";
+			gpios = <&gpio2 RK_PB6 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_POWER>;
+			wakeup-source;
+		};
+	};
+
+	/* Releases the power hold line, the board switches itself off */
+	gpio-poweroff {
+		compatible = "gpio-poweroff";
+		gpios = <&gpio2 RK_PB5 GPIO_ACTIVE_LOW>;
+	};
+
+	sdio_pwrseq: sdio-pwrseq {
+		compatible = "mmc-pwrseq-simple";
+		/* WiFi power enable, high = on */
+		reset-gpios = <&gpio1 RK_PB0 GPIO_ACTIVE_LOW>;
+	};
+
+	/*
+	 * Core voltages from PWM controlled DC/DC converters. Without a PWM
+	 * signal they run at about 1.45 V (vdd_arm) and 0.9 V (vdd_logic).
+	 *
+	 * The stock U-Boot (rockchip_pwm_regulator) uses
+	 *   duty % = (1450000 uV - voltage) / coefficient / 10
+	 * with coefficient 280 for vdd_arm and 550 for vdd_logic, and runs
+	 * them at 1.25 V / 1.2 V.
+	 *
+	 * vdd_arm follows the CPU clock (cpufreq, OPP table below), so it is
+	 * a continuous regulator: 1.45 V at 0 % duty down to 1.17 V at
+	 * 100 %, limited to 1.175 V (98.2 %) at the low end.
+	 */
+	vdd_arm: regulator-vdd-arm {
+		compatible = "pwm-regulator";
+		pwms = <&pwm1 0 25000 0>;
+		regulator-name = "vdd_arm";
+		regulator-min-microvolt = <1175000>;
+		regulator-max-microvolt = <1450000>;
+		regulator-always-on;
+		regulator-boot-on;
+		/* The stock U-Boot waits 200 us after changing the PWM */
+		regulator-settling-time-us = <500>;
+		pwm-dutycycle-unit = <1000>;
+		pwm-dutycycle-range = <982 0>;
+	};
+
+	vdd_logic: regulator-vdd-logic {
+		compatible = "pwm-regulator";
+		pwms = <&pwm2 0 25000 0>;
+		regulator-name = "vdd_logic";
+		regulator-min-microvolt = <1200000>;
+		regulator-max-microvolt = <1200000>;
+		regulator-always-on;
+		regulator-boot-on;
+		voltage-table = <1100000 63>,
+				<1150000 54>,
+				<1200000 45>,
+				<1250000 36>,
+				<1300000 27>;
+	};
+
+	/* SARADC reference, the stock firmware uses 1.8 V */
+	vcc_1v8_adc: regulator-vcc-1v8-adc {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc_1v8_adc";
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+		regulator-always-on;
+	};
+
+	/* Panel power switches, both active low in the stock firmware */
+	vcc_lcd: regulator-vcc-lcd {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc_lcd";
+		gpio = <&gpio0 RK_PA2 GPIO_ACTIVE_LOW>;
+		startup-delay-us = <100000>;
+	};
+
+	vcc_lcd_io: regulator-vcc-lcd-io {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc_lcd_io";
+		gpio = <&gpio1 RK_PB1 GPIO_ACTIVE_LOW>;
+		startup-delay-us = <100000>;
+	};
+};
+
+&dphy {
+	status = "okay";
+};
+
+&dsi {
+	#address-cells = <1>;
+	#size-cells = <0>;
+	status = "okay";
+
+	panel@0 {
+		compatible = "chongzhou,cz101b4001", "jadard,jd9365da-h3";
+		reg = <0>;
+		backlight = <&backlight>;
+		reset-gpios = <&gpio2 RK_PB0 GPIO_ACTIVE_LOW>;
+		vdd-supply = <&vcc_lcd>;
+		vccio-supply = <&vcc_lcd_io>;
+
+		port {
+			panel_in_dsi: endpoint {
+				remote-endpoint = <&dsi_out_panel>;
+			};
+		};
+	};
+};
+
+&dsi_out {
+	dsi_out_panel: endpoint {
+		remote-endpoint = <&panel_in_dsi>;
+	};
+};
+
+&display_subsystem {
+	status = "okay";
+};
+
+/*
+ * No pinctrl: RK3126 and RK3128 route EMMC_CMD to different pins, the
+ * Rockchip loader has already set them up.
+ */
+&emmc {
+	bus-width = <8>;
+	cap-mmc-highspeed;
+	non-removable;
+	no-sd;
+	no-sdio;
+	status = "okay";
+};
+
+/*
+ * Mali-400 MP2 (lima). vdd_logic also supplies the DDR and stays fixed at
+ * 1.2 V, so the GPU clock is scaled without voltage changes: drop the
+ * 480 MHz point (1.25 V). The stock firmware ran the GPU at 396 MHz.
+ */
+&gpu {
+	/* Fixed 1.2 V, within the range of all remaining GPU OPPs */
+	mali-supply = <&vdd_logic>;
+	status = "okay";
+};
+
+&gpu_opp_table {
+	/delete-node/ opp-480000000;
+};
+
+&i2c0 {
+	/*
+	 * The stock firmware uses 300 kHz, but then the GSL3673 reads back
+	 * wrong data (some 0 bits read as 1) and the firmware load fails.
+	 */
+	clock-frequency = <100000>;
+	status = "okay";
+
+	/*
+	 * The touch controller reports 1024x640 with its X axis along the
+	 * long side of the panel, running from the bottom (framebuffer
+	 * y = 1280) to the top.
+	 */
+	touchscreen@40 {
+		compatible = "silead,gsl3670";
+		reg = <0x40>;
+		interrupt-parent = <&gpio2>;
+		interrupts = <RK_PC3 IRQ_TYPE_EDGE_FALLING>;
+		power-gpios = <&gpio2 RK_PC2 GPIO_ACTIVE_HIGH>;
+		firmware-name = "gsl3673-denver-frame.fw";
+		touchscreen-size-x = <1024>;
+		touchscreen-size-y = <640>;
+		touchscreen-inverted-x;
+		touchscreen-swapped-x-y;
+		silead,max-fingers = <10>;
+	};
+};
+
+/* Enabled for probing only: the stock firmware lists a Goodix touch here */
+&i2c2 {
+	status = "okay";
+};
+
+/*
+ * Reading the QoS registers (saved before a power domain is switched off)
+ * causes an external abort on the RK3126, and the kernel then hangs on the
+ * power domain lock. Skip saving/restoring them; they only hold bus
+ * priorities.
+ */
+&power {
+	power-domain@RK3128_PD_VIO {
+		/delete-property/ pm_qos;
+	};
+
+	power-domain@RK3128_PD_VIDEO {
+		/delete-property/ pm_qos;
+	};
+
+	power-domain@RK3128_PD_GPU {
+		/delete-property/ pm_qos;
+	};
+};
+
+&pinctrl {
+	wifi {
+		wifi_host_wake: wifi-host-wake {
+			rockchip,pins = <2 RK_PC1 RK_FUNC_GPIO &pcfg_pull_default>;
+		};
+	};
+};
+
+&pwm0 {
+	status = "okay";
+};
+
+/* vdd_arm */
+&pwm1 {
+	status = "okay";
+};
+
+/* vdd_logic */
+&pwm2 {
+	status = "okay";
+};
+
+&saradc {
+	vref-supply = <&vcc_1v8_adc>;
+	status = "okay";
+};
+
+/* RK915 WiFi, out-of-tree driver in drivers/rk915 */
+&sdio {
+	#address-cells = <1>;
+	#size-cells = <0>;
+	bus-width = <4>;
+	cap-sd-highspeed;
+	cap-sdio-irq;
+	keep-power-in-suspend;
+	max-frequency = <50000000>;
+	mmc-pwrseq = <&sdio_pwrseq>;
+	no-mmc;
+	no-sd;
+	non-removable;
+	pinctrl-names = "default";
+	pinctrl-0 = <&sdio_clk &sdio_cmd &sdio_bus4>;
+	status = "okay";
+
+	/* The compatible also enables the SDIO quirks of kernel patch 0005 */
+	wifi: wifi@1 {
+		compatible = "rockchip,rk915";
+		reg = <1>;
+		interrupt-parent = <&gpio2>;
+		interrupts = <RK_PC1 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "host-wake";
+		pinctrl-names = "default";
+		pinctrl-0 = <&wifi_host_wake>;
+	};
+};
+
+&sdmmc {
+	bus-width = <1>;
+	disable-wp;
+	no-mmc;
+	no-sdio;
+	pinctrl-names = "default";
+	pinctrl-0 = <&sdmmc_clk &sdmmc_cmd &sdmmc_det>;
+	status = "okay";
+};
+
+&uart2 {
+	status = "okay";
+};
+
+&usb2phy {
+	status = "okay";
+};
+
+&usb2phy_host {
+	status = "okay";
+};
+
+&usb2phy_otg {
+	status = "okay";
+};
+
+&usb_host_ehci {
+	status = "okay";
+};
+
+&usb_host_ohci {
+	status = "okay";
+};
+
+&usb_otg {
+	dr_mode = "peripheral";
+	status = "okay";
+};
+
+/*
+ * IOMMU of the VOP, missing in rk3128.dtsi (same layout as on the RK3036:
+ * right behind the VOP registers, sharing its interrupt). The stock firmware
+ * uses it. Without it the VOP can only scan out physically contiguous
+ * buffers and every import of a GPU (lima) buffer fails with "failed to map
+ * sg_table to contiguous linear address".
+ */
+/ {
+	vop_mmu: iommu@1010e300 {
+		compatible = "rockchip,iommu";
+		reg = <0x1010e300 0x100>;
+		interrupts = <GIC_SPI 9 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&cru ACLK_LCDC0>, <&cru HCLK_LCDC0>;
+		clock-names = "aclk", "iface";
+		power-domains = <&power RK3128_PD_VIO>;
+		#iommu-cells = <0>;
+	};
+};
+
+&vop {
+	iommus = <&vop_mmu>;
+	status = "okay";
+};
+
+/* Hardware video codec, not used yet */
+&vpu {
+	status = "disabled";
+};
+
+&vpu_mmu {
+	status = "disabled";
+};

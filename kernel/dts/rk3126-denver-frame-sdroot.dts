@@ -1,0 +1,31 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Denver Frameo picture frame with the root filesystem on the SD card
+ * (Debian on the second partition).
+ *
+ * SDMMC_D0 and UART2_TX share GPIO1_C2. rk3126-denver-frame.dts keeps the
+ * pin on the UART and leaves the SD card alone; here the SD card needs it
+ * all the time, so UART2 is disabled. Console: display, USB serial
+ * (ttyGS0) and SSH over the USB Ethernet gadget.
+ *
+ * The SD card runs in 1-bit mode, so SDMMC_D1 (GPIO1_C3, UART2_RX) is not
+ * used and a connected USB-UART adapter does not disturb it.
+ */
+
+#include "rk3126-denver-frame.dts"
+
+&pinctrl {
+	sdmmc {
+		sdmmc_d0: sdmmc-d0 {
+			rockchip,pins = <1 RK_PC2 1 &pcfg_pull_default>;
+		};
+	};
+};
+
+&sdmmc {
+	pinctrl-0 = <&sdmmc_clk &sdmmc_cmd &sdmmc_det &sdmmc_d0>;
+};
+
+&uart2 {
+	status = "disabled";
+};

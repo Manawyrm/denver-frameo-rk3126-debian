@@ -1,0 +1,13 @@
+[Unit]
+Description=Take WiFi and SSH key files from the boot partition
+Documentation=file:///usr/local/sbin/boot-config
+RequiresMountsFor=/boot/firmware
+Before=network-pre.target ssh.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/boot-config
+
+[Install]
+WantedBy=multi-user.target

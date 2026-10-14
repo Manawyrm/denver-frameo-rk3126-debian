@@ -1,0 +1,20 @@
+From: picture-frame build
+Subject: [PATCH] mmc: dw_mmc: honour bus-width = <1>
+
+dwmci_setup_cfg() enabled 4-bit mode for every host that is not 8-bit.
+On the RK3126 the SD card D1 line is shared with UART2_RX, so the card
+must stay in 1-bit mode, otherwise all data reads fail after ACMD6.
+---
+diff --git a/drivers/mmc/dw_mmc.c b/drivers/mmc/dw_mmc.c
+index c2424d78..636ed7ff 100644
+--- a/drivers/mmc/dw_mmc.c
++++ b/drivers/mmc/dw_mmc.c
+@@ -770,6 +770,8 @@ void dwmci_setup_cfg(struct mmc_config *cfg, struct dwmci_host *host,
+ 	if (host->buswidth == 8) {
+ 		cfg->host_caps |= MMC_MODE_8BIT;
+ 		cfg->host_caps &= ~MMC_MODE_4BIT;
++	} else if (host->buswidth == 1) {
++		cfg->host_caps &= ~(MMC_MODE_4BIT | MMC_MODE_8BIT);
+ 	} else {
+ 		cfg->host_caps |= MMC_MODE_4BIT;
+ 		cfg->host_caps &= ~MMC_MODE_8BIT;

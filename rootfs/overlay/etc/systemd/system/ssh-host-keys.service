@@ -1,0 +1,11 @@
+[Unit]
+Description=Generate the SSH host keys (first boot, the image has none)
+Before=ssh.service
+ConditionPathExistsGlob=!/etc/ssh/ssh_host_*_key
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/ssh-keygen -A
+
+[Install]
+WantedBy=multi-user.target

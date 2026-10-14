@@ -1,0 +1,106 @@
+#!/bin/sh
+# USB gadget on the OTG port: serial console (ACM, ttyGS0 on the frame,
+# ttyACM on the PC) and Ethernet (ECM, usb0, configured by
+# systemd-networkd). Same IDs and MAC addresses as the rescue system, so
+# the PC sees the same network adapter.
+#
+# Usage: usb-gadget start|stop
+
+GADGET=/sys/kernel/config/usb_gadget/frame
+
+DEV_MAC=02:52:4b:31:32:36
+HOST_MAC=02:52:4b:31:32:37
+
+gadget_start()
+{
+	i=0
+	while [ -z "$(ls /sys/class/udc 2>/dev/null)" ] && [ $i -lt 10 ]
+	do
+		sleep 1
+		i=$((i + 1))
+	done
+	udc=$(ls /sys/class/udc 2>/dev/null | head -n 1)
+	if [ -z "$udc" ]
+	then
+		echo "usb-gadget: no USB device controller found." >&2
+		exit 1
+	fi
+
+	serial=$(cat /sys/block/mmcblk0/device/serial 2>/dev/null)
+	if [ -z "$serial" ]
+	then
+		serial=0x00000000
+	fi
+
+	mkdir -p "$GADGET"
+	cd "$GADGET" || exit 1
+
+	# Linux Foundation "Multifunction Composite Gadget"
+	echo 0x1d6b > idVendor
+	echo 0x0104 > idProduct
+	echo 0x0100 > bcdDevice
+	echo 0x0200 > bcdUSB
+
+	# High speed transfers fail on the frame's USB-C port
+	if grep -q "usbspeed=full" /proc/cmdline
+	then
+		echo full-speed > max_speed
+	fi
+
+	mkdir -p strings/0x409
+	echo "Denver Frameo" > strings/0x409/manufacturer
+	echo "RK3126 picture frame (Debian)" > strings/0x409/product
+	echo "$serial" > strings/0x409/serialnumber
+
+	mkdir -p functions/acm.GS0
+	mkdir -p functions/ecm.usb0
+	echo "$DEV_MAC" > functions/ecm.usb0/dev_addr
+	echo "$HOST_MAC" > functions/ecm.usb0/host_addr
+
+	mkdir -p configs/c.1/strings/0x409
+	echo "serial console + Ethernet" > configs/c.1/strings/0x409/configuration
+	echo 250 > configs/c.1/MaxPower
+	ln -s functions/acm.GS0 configs/c.1/
+	ln -s functions/ecm.usb0 configs/c.1/
+
+	# Release the UDC from the built-in legacy gadget (g_ether)
+	for g in /sys/bus/gadget/drivers/g_*/gadget.*
+	do
+		if [ -e "$g" ]
+		then
+			basename "$g" > "$(dirname "$g")/unbind"
+		fi
+	done
+
+	echo "$udc" > UDC
+}
+
+gadget_stop()
+{
+	if [ ! -d "$GADGET" ]
+	then
+		exit 0
+	fi
+
+	cd "$GADGET" || exit 1
+	echo "" > UDC 2>/dev/null
+	rm -f configs/c.1/acm.GS0 configs/c.1/ecm.usb0
+	rmdir configs/c.1/strings/0x409 configs/c.1
+	rmdir functions/acm.GS0 functions/ecm.usb0
+	rmdir strings/0x409
+	cd /
+	rmdir "$GADGET"
+}
+
+case "$1" in
+	start)
+		gadget_start
+		;;
+	stop)
+		gadget_stop
+		;;
+	*)
+		echo "Usage: $0 start|stop" >&2
+		exit 1
+		;;
+esac

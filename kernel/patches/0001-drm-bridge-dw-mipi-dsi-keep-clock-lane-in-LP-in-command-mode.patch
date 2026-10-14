@@ -1,0 +1,29 @@
+From: picture-frame build
+Subject: [PATCH] drm/bridge: dw-mipi-dsi: keep the clock lane in LP in command mode
+
+The JD9365 panel of the Denver frame only initialises its DSI receiver
+when it sees LP-11 on the clock lane after its reset. The panel driver
+resets and initialises the panel while the host is in command mode, so
+only drive the HS clock there while a packet is sent.
+---
+diff --git a/drivers/gpu/drm/bridge/synopsys/dw-mipi-dsi.c b/drivers/gpu/drm/bridge/synopsys/dw-mipi-dsi.c
+index af176e136..a13143ddc 100644
+--- a/drivers/gpu/drm/bridge/synopsys/dw-mipi-dsi.c
++++ b/drivers/gpu/drm/bridge/synopsys/dw-mipi-dsi.c
+@@ -643,8 +643,15 @@ static void dw_mipi_dsi_set_mode(struct dw_mipi_dsi *dsi,
+ 		dsi_write(dsi, DSI_MODE_CFG, ENABLE_CMD_MODE);
+ 	}
+ 
++	/*
++	 * In command mode the panel is usually reset and initialised. Some
++	 * panels (e.g. JD9365) only initialise their receiver when they see
++	 * LP-11 on the clock lane after the reset, so only drive the HS clock
++	 * while a packet is sent.
++	 */
+ 	val = PHY_TXREQUESTCLKHS;
+-	if (dsi->mode_flags & MIPI_DSI_CLOCK_NON_CONTINUOUS)
++	if ((dsi->mode_flags & MIPI_DSI_CLOCK_NON_CONTINUOUS) ||
++	    !(mode_flags & MIPI_DSI_MODE_VIDEO))
+ 		val |= AUTO_CLKLANE_CTRL;
+ 	dsi_write(dsi, DSI_LPCLK_CTRL, val);
+ 

@@ -1,0 +1,32 @@
+#!/bin/sh
+# Like Raspberry Pi OS: configuration files put on the boot partition (FAT,
+# writable from any PC) are taken over at boot and removed from there.
+#
+#   wpa_supplicant.conf  -> /etc/wpa_supplicant/wpa_supplicant.conf (WiFi)
+#   authorized_keys      -> added to /root/.ssh/authorized_keys (SSH keys)
+
+boot=/boot/firmware
+
+if [ -f "$boot/wpa_supplicant.conf" ]
+then
+	install -m 600 "$boot/wpa_supplicant.conf" /etc/wpa_supplicant/wpa_supplicant.conf
+	rm -f "$boot/wpa_supplicant.conf"
+	echo "boot-config: WiFi configuration taken from $boot/wpa_supplicant.conf"
+fi
+
+if [ -f "$boot/authorized_keys" ]
+then
+	install -d -m 700 /root/.ssh
+	touch /root/.ssh/authorized_keys
+	# Only keys that are not there yet; the FAT file may have DOS line ends
+	tr -d '\r' < "$boot/authorized_keys" | while read -r key
+	do
+		if [ -n "$key" ] && ! grep -qxF "$key" /root/.ssh/authorized_keys
+		then
+			echo "$key" >> /root/.ssh/authorized_keys
+		fi
+	done
+	chmod 600 /root/.ssh/authorized_keys
+	rm -f "$boot/authorized_keys"
+	echo "boot-config: SSH keys taken from $boot/authorized_keys"
+fi
