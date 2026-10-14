@@ -76,3 +76,11 @@ The picture frame has full USB peripheral support and will expose itself as a US
 - Hantro hardware video decoding (V4L2, H.264 only), will only work in ffmpeg and Firefox
 - Audio support
 - USB host mode (e.g. wired Ethernet, storage, keyboard/mice, etc.) -- would pair well with a cheap USB-C PoE adapter!
+
+# Internals/PCBs
+
+![Picture frame internals](assets/denver-frameo-rk3126-internals.jpg)
+![PCB frontside, RK3126 CPU, RK915 WiFi, DDR3 RAM](assets/denver-frameo-rk3126-pcb-front.jpg)
+![PCB backside, FORESEE eMMC, Silead GSL1680 Touch, more DDR3 RAM](assets/denver-frameo-rk3126-pcb-back.jpg)
+![Fastfetch](assets/fastfetch.jpg)
+![ImmichFrame](assets/immichframe.jpg)
