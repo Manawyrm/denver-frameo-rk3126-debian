@@ -15,8 +15,8 @@
  *   WiFi        RK915 on SDIO, power GPIO1_B0, wakeup GPIO2_C1
  *   power off   GPIO2_B5 (power hold, active low = off)
  *
- * vdd_arm and vdd_logic come from PWM regulators on PWM1/PWM2, set to the
- * stock voltages (1.25 V / 1.2 V, no CPU frequency scaling yet).
+ * vdd_arm comes from a PWM controlled DC/DC converter on PWM1, vdd_logic
+ * from a fixed one (board rails "AVDD" and "CVDD", voltages measured).
  *
  * UART2 (GPIO1_C2/C3) shares its pins with SDMMC_D0/D1. This device tree
  * keeps them on the UART (SD card in 1-bit mode without D0, only usable
@@ -39,31 +39,47 @@
 };
 
 /*
- * vdd_arm cannot go below 1.175 V. The stock firmware ran the CPU at
- * 816 MHz / 1.15 V and 1008 MHz / 1.2 V. 1200 MHz at 1.325 V (mainline
- * table) hung the board under load on all four cores, so the stock
- * maximum is kept. There is no temperature sensor.
+ * Voltages are real (measured curve of vdd_arm, see the regulator), the
+ * limits found with a self-checking stress test on all four cores
+ * (2026-10-15): 816 MHz runs at the lowest possible 1.241 V, 1008 MHz needs
+ * about 1.36 V, 1104 MHz 1.44 V, 1200 MHz 1.52 V; 1296 MHz fails even at
+ * the regulator maximum of 1.546 V. The stock voltage for 1008 MHz
+ * (1.2 V nominal, 1.27 V real) is too low and produces wrong results.
+ *
+ * 1008 and 1104 MHz get about 60 mV of margin. 1200 MHz is only reached at
+ * the regulator maximum (25 mV margin), so it is a turbo OPP: used only
+ * after "echo 1 > /sys/devices/system/cpu/cpufreq/boost". The chip reached
+ * about 53 degrees C at 1200 MHz under full load. There is no temperature
+ * sensor.
  */
 &cpu_opp_table {
 	opp-216000000 {
-		opp-microvolt = <1175000 1175000 1450000>;
+		opp-microvolt = <1241000 1241000 1546000>;
 	};
 	opp-408000000 {
-		opp-microvolt = <1175000 1175000 1450000>;
+		opp-microvolt = <1241000 1241000 1546000>;
 	};
 	opp-600000000 {
-		opp-microvolt = <1175000 1175000 1450000>;
+		opp-microvolt = <1241000 1241000 1546000>;
 	};
 	opp-696000000 {
-		opp-microvolt = <1175000 1175000 1450000>;
+		opp-microvolt = <1241000 1241000 1546000>;
 	};
 	opp-816000000 {
-		opp-microvolt = <1175000 1175000 1450000>;
+		opp-microvolt = <1241000 1241000 1546000>;
 	};
 	opp-1008000000 {
-		opp-microvolt = <1200000 1200000 1450000>;
+		opp-microvolt = <1425000 1425000 1546000>;
 	};
-	/delete-node/ opp-1200000000;
+	opp-1104000000 {
+		opp-hz = /bits/ 64 <1104000000>;
+		opp-microvolt = <1500000 1500000 1546000>;
+		clock-latency-ns = <40000>;
+	};
+	opp-1200000000 {
+		opp-microvolt = <1546000 1546000 1546000>;
+		turbo-mode;
+	};
 };
 
 / {
@@ -141,24 +157,21 @@
 	};
 
 	/*
-	 * Core voltages from PWM controlled DC/DC converters. Without a PWM
-	 * signal they run at about 1.45 V (vdd_arm) and 0.9 V (vdd_logic).
+	 * CPU core voltage (board rail "AVDD"), a DC/DC converter controlled
+	 * by PWM1. Measured on the board (2026-10-15): linear, 1546 mV at
+	 * 0 % duty, 3.106 mV less per percent, 1241 mV at 98.2 %. The stock
+	 * U-Boot formula (1450 mV at 0 %, 2.8 mV per percent) is 66 to 96 mV
+	 * too low for this board.
 	 *
-	 * The stock U-Boot (rockchip_pwm_regulator) uses
-	 *   duty % = (1450000 uV - voltage) / coefficient / 10
-	 * with coefficient 280 for vdd_arm and 550 for vdd_logic, and runs
-	 * them at 1.25 V / 1.2 V.
-	 *
-	 * vdd_arm follows the CPU clock (cpufreq, OPP table below), so it is
-	 * a continuous regulator: 1.45 V at 0 % duty down to 1.17 V at
-	 * 100 %, limited to 1.175 V (98.2 %) at the low end.
+	 * vdd_arm follows the CPU clock (cpufreq, OPP table above), so it is
+	 * a continuous regulator, limited to the measured range up to 98.2 %.
 	 */
 	vdd_arm: regulator-vdd-arm {
 		compatible = "pwm-regulator";
 		pwms = <&pwm1 0 25000 0>;
 		regulator-name = "vdd_arm";
-		regulator-min-microvolt = <1175000>;
-		regulator-max-microvolt = <1450000>;
+		regulator-min-microvolt = <1241000>;
+		regulator-max-microvolt = <1546000>;
 		regulator-always-on;
 		regulator-boot-on;
 		/* The stock U-Boot waits 200 us after changing the PWM */
@@ -167,19 +180,20 @@
 		pwm-dutycycle-range = <982 0>;
 	};
 
+	/*
+	 * Logic core voltage (board rail "CVDD", also GPU and DDR controller),
+	 * measured 1.148 V. A fixed DC/DC converter: the RK3126 has no
+	 * PWM2 pin (GPIO0_D4 is not bonded out), the PWM2 regulator of the
+	 * stock device tree comes from the RK3128 SDK and does nothing here.
+	 * Declared as 1.15 V so the 400 MHz GPU OPP (minimum 1.15 V) stays.
+	 */
 	vdd_logic: regulator-vdd-logic {
-		compatible = "pwm-regulator";
-		pwms = <&pwm2 0 25000 0>;
+		compatible = "regulator-fixed";
 		regulator-name = "vdd_logic";
-		regulator-min-microvolt = <1200000>;
-		regulator-max-microvolt = <1200000>;
+		regulator-min-microvolt = <1150000>;
+		regulator-max-microvolt = <1150000>;
 		regulator-always-on;
 		regulator-boot-on;
-		voltage-table = <1100000 63>,
-				<1150000 54>,
-				<1200000 45>,
-				<1250000 36>,
-				<1300000 27>;
 	};
 
 	/* SARADC reference, the stock firmware uses 1.8 V */
@@ -256,12 +270,12 @@
 };
 
 /*
- * Mali-400 MP2 (lima). vdd_logic also supplies the DDR and stays fixed at
- * 1.2 V, so the GPU clock is scaled without voltage changes: drop the
- * 480 MHz point (1.25 V). The stock firmware ran the GPU at 396 MHz.
+ * Mali-400 MP2 (lima). vdd_logic is fixed at 1.15 V, so the GPU clock is
+ * scaled without voltage changes: drop the 480 MHz point (1.25 V). The
+ * stock firmware ran the GPU at 396 MHz.
  */
 &gpu {
-	/* Fixed 1.2 V, within the range of all remaining GPU OPPs */
+	/* Fixed 1.15 V, within the range of all remaining GPU OPPs */
 	mali-supply = <&vdd_logic>;
 	status = "okay";
 };
@@ -337,11 +351,6 @@
 
 /* vdd_arm */
 &pwm1 {
-	status = "okay";
-};
-
-/* vdd_logic */
-&pwm2 {
 	status = "okay";
 };
 
