@@ -1,0 +1,13 @@
+#!/bin/sh
+# Called by the kernel package after installation (version, image path):
+# rebuild the module index. The package ships its own modules.dep, which
+# does not know the out-of-tree modules of other packages (rk915-modules in
+# /lib/modules/<version>/updates). Without this they are no longer loaded
+# after the kernel package is reinstalled or updated.
+
+set -e
+
+version=$1
+
+echo "depmod: updating the module index of $version"
+depmod -a "$version"
