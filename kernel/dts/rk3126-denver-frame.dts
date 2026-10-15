@@ -451,11 +451,15 @@
 	status = "okay";
 };
 
-/* Hardware video codec, not used yet */
+/*
+ * Hardware video codec (Hantro G1/H1, hantro driver): decodes H.264,
+ * MPEG-2 and VP8, encodes JPEG. The separate HEVC decoder of the RK3126
+ * has no mainline driver.
+ */
 &vpu {
-	status = "disabled";
+	status = "okay";
 };
 
 &vpu_mmu {
-	status = "disabled";
+	status = "okay";
 };

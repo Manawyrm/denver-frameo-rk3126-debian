@@ -28,6 +28,7 @@ Clean, mainline Debian Linux image (similar to Raspberry Pi OS) for the Denver F
 - Dynamic frequency scaling (idle support, reduces power consumption)
 - USB peripheral mode
 - MicroSD and eMMC support
+- Hardware video decoding (Hantro VPU: H.264 up to 1080p at ~30 fps, VP8, MPEG-2) through the V4L2 stateless decoder API, e.g. GStreamer `v4l2slh264dec` (not installed by default, not used by Chromium)
 
 # Performance
 
@@ -84,7 +85,6 @@ The picture frame has full USB peripheral support and will expose itself as a US
 
 # Possible future improvements (not yet supported)
 
-- Hantro hardware video decoding (V4L2, H.264 only), will only work in ffmpeg and Firefox
 - Audio support
 - USB host mode (e.g. wired Ethernet, storage, keyboard/mice, etc.) -- would pair well with a cheap USB-C PoE adapter!
 

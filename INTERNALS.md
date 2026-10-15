@@ -80,6 +80,12 @@ output/linux-headers-7.2.10-rk3126_7.2.10-1_armhf.deb
 output/linux-libc-dev_7.2.10-1_armhf.deb
 ```
 
+The config fragment enables the Hantro VPU driver (`hantro-vpu` module,
+`/dev/video1` decoder, `/dev/video0` JPEG encoder) with only the media core
+and the memory-to-memory drivers. Measured with GStreamer (`v4l2slh264dec`
+and friends, kiosk stopped): H.264 1080p 33 fps, 720p H.264/VP8/MPEG-2
+55-64 fps, at 15-20 % CPU.
+
 The image package contains the kernel, the modules and the device trees
 (`/usr/lib/linux-image-7.2.10-rk3126/rk3126-denver-frame*.dtb`). The `-dbg`
 package has the debug symbols (`vmlinux` and modules) for crash analysis.
@@ -167,7 +173,9 @@ from `output/`. Result: `output/rootfs.tar`.
   on `/boot/firmware`. On every kernel package installation
   `/etc/kernel/postinst.d/zz-frame-boot-partition` copies `zImage` and the
   device trees there, so `apt` kernel updates work. `uEnv.txt` there holds
-  the boot settings for U-Boot.
+  the boot settings for U-Boot. `/etc/kernel/postinst.d/depmod` rebuilds
+  the module index: the kernel package ships its own `modules.dep`, which
+  would drop the RK915 driver (`updates/rk915.ko`) on every kernel update.
 - **WiFi**: `/etc/network/interfaces.d/wlan0` (DHCP) with
   `/etc/wpa_supplicant/wpa_supplicant.conf`.
 - **Configuration from the boot partition** (like Raspberry Pi OS,
