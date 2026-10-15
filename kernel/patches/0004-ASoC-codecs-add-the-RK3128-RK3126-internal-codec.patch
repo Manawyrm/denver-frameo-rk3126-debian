@@ -1,0 +1,507 @@
+From: picture-frame build
+Subject: [PATCH] ASoC: codecs: add the RK3128/RK3126 internal codec
+
+The RK3128 and RK3126 have an internal Inno audio codec with a different
+register map than the RK3036 one (inno_rk3036.c). This is a playback
+driver for it: DAC and the headphone/line output stage, with the power
+sequences of the Rockchip vendor driver (rk312x_codec.c). The power
+sequence runs as the DAC's DAPM event, so an external speaker amplifier
+(e.g. simple-audio-amplifier) is switched on after and off before it.
+---
+--- a/sound/soc/codecs/Kconfig
++++ b/sound/soc/codecs/Kconfig
+@@ -1384,6 +1384,14 @@
+ 	depends on ARCH_ROCKCHIP || COMPILE_TEST
+ 	select REGMAP_MMIO
+ 
++config SND_SOC_INNO_RK3128
++	tristate "Inno codec driver for RK3128/RK3126 SoC"
++	depends on ARCH_ROCKCHIP || COMPILE_TEST
++	select REGMAP_MMIO
++	help
++	  Playback driver for the internal audio codec of the Rockchip
++	  RK3128 and RK3126 (DAC and line/headphone output).
++
+ config SND_SOC_ISABELLE
+ 	tristate
+ 	depends on I2C
+--- a/sound/soc/codecs/Makefile
++++ b/sound/soc/codecs/Makefile
+@@ -150,6 +150,7 @@
+ snd-soc-ics43432-y := ics43432.o
+ snd-soc-idt821034-y := idt821034.o
+ snd-soc-inno-rk3036-y := inno_rk3036.o
++snd-soc-inno-rk3128-y := inno_rk3128.o
+ snd-soc-isabelle-y := isabelle.o
+ snd-soc-jz4740-codec-y := jz4740.o
+ snd-soc-jz4725b-codec-y := jz4725b.o
+@@ -591,6 +592,7 @@
+ obj-$(CONFIG_SND_SOC_ICS43432)	+= snd-soc-ics43432.o
+ obj-$(CONFIG_SND_SOC_IDT821034)	+= snd-soc-idt821034.o
+ obj-$(CONFIG_SND_SOC_INNO_RK3036)	+= snd-soc-inno-rk3036.o
++obj-$(CONFIG_SND_SOC_INNO_RK3128)	+= snd-soc-inno-rk3128.o
+ obj-$(CONFIG_SND_SOC_ISABELLE)	+= snd-soc-isabelle.o
+ obj-$(CONFIG_SND_SOC_JZ4740_CODEC)	+= snd-soc-jz4740-codec.o
+ obj-$(CONFIG_SND_SOC_JZ4725B_CODEC)	+= snd-soc-jz4725b-codec.o
+--- /dev/null
++++ b/sound/soc/codecs/inno_rk3128.c
+@@ -0,0 +1,459 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Driver for the internal audio codec of the Rockchip RK3128 and RK3126,
++ * an Inno design with a different register map than the RK3036 one.
++ *
++ * Playback only: the DAC and the headphone/line output stage, which on
++ * most RK312x boards feeds an external speaker amplifier. The power
++ * sequences are the ones of the Rockchip vendor driver (rk312x_codec.c).
++ */
++
++#include <linux/bits.h>
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++#include <sound/pcm_params.h>
++#include <sound/soc.h>
++#include <sound/tlv.h>
++
++#define RK3128_RESET			0x00
++#define RK3128_ADC_INT_CTL2		0x0c
++#define RK3128_DAC_INT_CTL1		0x10
++#define RK3128_DAC_INT_CTL2		0x14
++#define RK3128_DAC_INT_CTL3		0x18
++#define RK3128_DAC_CTL			0xa0
++#define RK3128_DAC_ENABLE		0xa4
++#define RK3128_HPMIX_CTL		0xa8
++#define RK3128_HPMIX_S_SELECT		0xac
++#define RK3128_HPOUT_CTL		0xb0
++#define RK3128_HPOUTL_GAIN		0xb4
++#define RK3128_HPOUTR_GAIN		0xb8
++#define RK3128_MAX_REGISTER		0x164
++
++/* ADC interface control 2: the I2S clock role applies to both directions */
++#define RK3128_I2S_MODE_MASK		BIT(4)
++#define RK3128_I2S_MODE_MASTER		BIT(4)
++#define RK3128_I2S_MODE_SLAVE		0
++
++/* DAC interface control 1 */
++#define RK3128_DLRCK_POL		BIT(7)
++#define RK3128_DAC_VWL_MASK		GENMASK(6, 5)
++#define RK3128_DAC_VWL_16		(0 << 5)
++#define RK3128_DAC_VWL_20		(1 << 5)
++#define RK3128_DAC_VWL_24		(2 << 5)
++#define RK3128_DAC_VWL_32		(3 << 5)
++#define RK3128_DAC_DF_MASK		GENMASK(4, 3)
++#define RK3128_DAC_DF_RJ		(0 << 3)
++#define RK3128_DAC_DF_LJ		(1 << 3)
++#define RK3128_DAC_DF_I2S		(2 << 3)
++#define RK3128_DAC_DF_PCM		(3 << 3)
++#define RK3128_DAC_SWAP			BIT(2)
++
++/* DAC interface control 2 */
++#define RK3128_DAC_WL_MASK		GENMASK(3, 2)
++#define RK3128_DAC_WL_16		(0 << 2)
++#define RK3128_DAC_WL_20		(1 << 2)
++#define RK3128_DAC_WL_24		(2 << 2)
++#define RK3128_DAC_WL_32		(3 << 2)
++#define RK3128_DAC_RUN			BIT(1)	/* 0: interface held in reset */
++#define RK3128_DBCLK_POL		BIT(0)
++
++/* Output stage gain: 0 ... 31 = -39 dB ... +7.5 dB in 1.5 dB steps */
++#define RK3128_HPOUT_GAIN_MAX		31
++#define RK3128_HPOUT_GAIN_DEFAULT	25
++
++struct rk3128_reg_val {
++	unsigned int reg;
++	unsigned int val;
++};
++
++/* Playback power up until the output gain is set, 1 ms between the writes */
++static const struct rk3128_reg_val rk3128_power_up[] = {
++	{ RK3128_DAC_INT_CTL3, 0x32 },
++	{ RK3128_DAC_CTL, 0x48 },
++	{ RK3128_DAC_CTL, 0x6a },
++	{ RK3128_HPOUTL_GAIN, 0x80 },
++	{ RK3128_HPOUTR_GAIN, 0x80 },
++	{ RK3128_HPMIX_CTL, 0x44 },
++	{ RK3128_HPMIX_CTL, 0x55 },
++	{ RK3128_HPOUT_CTL, 0x90 },
++	{ RK3128_HPOUT_CTL, 0xd8 },
++	{ RK3128_DAC_ENABLE, 0x88 },
++	{ RK3128_DAC_ENABLE, 0xcc },
++	{ RK3128_DAC_ENABLE, 0xee },
++	{ RK3128_DAC_ENABLE, 0xff },
++	{ RK3128_HPMIX_S_SELECT, 0x11 },	/* mixer input: DAC */
++	{ RK3128_HPMIX_CTL, 0x77 },
++	{ RK3128_HPOUT_CTL, 0xfc },
++};
++
++/* After the gain: unmute the output, DAC fully on */
++static const struct rk3128_reg_val rk3128_power_up_end[] = {
++	{ RK3128_HPOUT_CTL, 0xff },
++	{ RK3128_DAC_CTL, 0x7b },
++};
++
++static const struct rk3128_reg_val rk3128_power_down[] = {
++	{ RK3128_HPOUT_CTL, 0xdb },
++	{ RK3128_HPMIX_CTL, 0x44 },
++	{ RK3128_HPMIX_S_SELECT, 0x00 },
++	{ RK3128_HPOUT_CTL, 0x92 },
++	{ RK3128_DAC_CTL, 0x2a },
++	{ RK3128_HPOUT_CTL, 0x00 },
++	{ RK3128_HPMIX_CTL, 0x00 },
++	{ RK3128_DAC_ENABLE, 0x00 },
++	{ RK3128_DAC_CTL, 0x08 },
++	{ RK3128_HPOUTL_GAIN, 0x00 },
++	{ RK3128_HPOUTR_GAIN, 0x00 },
++	{ RK3128_DAC_INT_CTL3, 0x22 },
++};
++
++struct rk3128_codec {
++	struct regmap *regmap;
++	struct clk *pclk;
++	unsigned int mclk;
++	unsigned int gain;
++	bool powered;
++};
++
++static void rk3128_write_sequence(struct rk3128_codec *priv,
++				  const struct rk3128_reg_val *seq,
++				  unsigned int len, bool slow)
++{
++	unsigned int i;
++
++	for (i = 0; i < len; i++) {
++		regmap_write(priv->regmap, seq[i].reg, seq[i].val);
++		if (slow)
++			usleep_range(1000, 1100);
++	}
++}
++
++static void rk3128_playback_power_up(struct rk3128_codec *priv)
++{
++	rk3128_write_sequence(priv, rk3128_power_up,
++			      ARRAY_SIZE(rk3128_power_up), true);
++	regmap_write(priv->regmap, RK3128_HPOUTL_GAIN, priv->gain);
++	regmap_write(priv->regmap, RK3128_HPOUTR_GAIN, priv->gain);
++	rk3128_write_sequence(priv, rk3128_power_up_end,
++			      ARRAY_SIZE(rk3128_power_up_end), true);
++	priv->powered = true;
++}
++
++static void rk3128_playback_power_down(struct rk3128_codec *priv)
++{
++	priv->powered = false;
++	rk3128_write_sequence(priv, rk3128_power_down,
++			      ARRAY_SIZE(rk3128_power_down), false);
++}
++
++/*
++ * The DAC widget carries the whole playback power sequence: DAPM powers
++ * it up before and down after the speaker amplifier, which avoids pops.
++ */
++static int rk3128_dac_event(struct snd_soc_dapm_widget *w,
++			    struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_component *component = snd_soc_dapm_to_component(w->dapm);
++	struct rk3128_codec *priv = snd_soc_component_get_drvdata(component);
++
++	switch (event) {
++	case SND_SOC_DAPM_POST_PMU:
++		rk3128_playback_power_up(priv);
++		break;
++	case SND_SOC_DAPM_PRE_PMD:
++		rk3128_playback_power_down(priv);
++		break;
++	}
++
++	return 0;
++}
++
++/*
++ * The power sequences overwrite the gain registers, so the volume is kept
++ * here and written whenever the output stage is powered. One control for
++ * both channels.
++ */
++static int rk3128_gain_get(struct snd_kcontrol *kcontrol,
++			   struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
++	struct rk3128_codec *priv = snd_soc_component_get_drvdata(component);
++
++	ucontrol->value.integer.value[0] = priv->gain;
++
++	return 0;
++}
++
++static int rk3128_gain_put(struct snd_kcontrol *kcontrol,
++			   struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
++	struct rk3128_codec *priv = snd_soc_component_get_drvdata(component);
++	long gain = ucontrol->value.integer.value[0];
++	int changed;
++
++	if (gain < 0 || gain > RK3128_HPOUT_GAIN_MAX)
++		return -EINVAL;
++
++	changed = gain != priv->gain;
++	priv->gain = gain;
++
++	if (priv->powered) {
++		regmap_write(priv->regmap, RK3128_HPOUTL_GAIN, gain);
++		regmap_write(priv->regmap, RK3128_HPOUTR_GAIN, gain);
++	}
++
++	return changed;
++}
++
++static const DECLARE_TLV_DB_SCALE(rk3128_out_tlv, -3900, 150, 0);
++
++static const struct snd_kcontrol_new rk3128_controls[] = {
++	SOC_SINGLE_EXT_TLV("Master Playback Volume", SND_SOC_NOPM, 0,
++			   RK3128_HPOUT_GAIN_MAX, 0,
++			   rk3128_gain_get, rk3128_gain_put, rk3128_out_tlv),
++};
++
++static const struct snd_soc_dapm_widget rk3128_dapm_widgets[] = {
++	SND_SOC_DAPM_DAC_E("DAC", "Playback", SND_SOC_NOPM, 0, 0,
++			   rk3128_dac_event,
++			   SND_SOC_DAPM_POST_PMU | SND_SOC_DAPM_PRE_PMD),
++	SND_SOC_DAPM_OUTPUT("HPOUTL"),
++	SND_SOC_DAPM_OUTPUT("HPOUTR"),
++};
++
++static const struct snd_soc_dapm_route rk3128_dapm_routes[] = {
++	{ "HPOUTL", NULL, "DAC" },
++	{ "HPOUTR", NULL, "DAC" },
++};
++
++static int rk3128_set_dai_sysclk(struct snd_soc_dai *dai, int clk_id,
++				 unsigned int freq, int dir)
++{
++	struct rk3128_codec *priv = snd_soc_component_get_drvdata(dai->component);
++
++	priv->mclk = freq;
++
++	return 0;
++}
++
++static int rk3128_set_dai_fmt(struct snd_soc_dai *dai, unsigned int fmt)
++{
++	struct rk3128_codec *priv = snd_soc_component_get_drvdata(dai->component);
++	unsigned int mode;
++	unsigned int ctl1 = 0;
++	unsigned int ctl2 = 0;
++
++	switch (fmt & SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK) {
++	case SND_SOC_DAIFMT_CBC_CFC:
++		mode = RK3128_I2S_MODE_SLAVE;
++		break;
++	case SND_SOC_DAIFMT_CBP_CFP:
++		mode = RK3128_I2S_MODE_MASTER;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	switch (fmt & SND_SOC_DAIFMT_FORMAT_MASK) {
++	case SND_SOC_DAIFMT_I2S:
++		ctl1 |= RK3128_DAC_DF_I2S;
++		break;
++	case SND_SOC_DAIFMT_LEFT_J:
++		ctl1 |= RK3128_DAC_DF_LJ;
++		break;
++	case SND_SOC_DAIFMT_RIGHT_J:
++		ctl1 |= RK3128_DAC_DF_RJ;
++		break;
++	case SND_SOC_DAIFMT_DSP_A:
++		ctl1 |= RK3128_DAC_DF_PCM;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	switch (fmt & SND_SOC_DAIFMT_INV_MASK) {
++	case SND_SOC_DAIFMT_NB_NF:
++		break;
++	case SND_SOC_DAIFMT_IB_NF:
++		ctl2 |= RK3128_DBCLK_POL;
++		break;
++	case SND_SOC_DAIFMT_NB_IF:
++		ctl1 |= RK3128_DLRCK_POL;
++		break;
++	case SND_SOC_DAIFMT_IB_IF:
++		ctl1 |= RK3128_DLRCK_POL;
++		ctl2 |= RK3128_DBCLK_POL;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	regmap_update_bits(priv->regmap, RK3128_ADC_INT_CTL2,
++			   RK3128_I2S_MODE_MASK, mode);
++	regmap_update_bits(priv->regmap, RK3128_DAC_INT_CTL1,
++			   RK3128_DLRCK_POL | RK3128_DAC_DF_MASK, ctl1);
++	regmap_update_bits(priv->regmap, RK3128_DAC_INT_CTL2,
++			   RK3128_DBCLK_POL, ctl2);
++
++	return 0;
++}
++
++static int rk3128_hw_params(struct snd_pcm_substream *substream,
++			    struct snd_pcm_hw_params *params,
++			    struct snd_soc_dai *dai)
++{
++	struct rk3128_codec *priv = snd_soc_component_get_drvdata(dai->component);
++	unsigned int rate = params_rate(params);
++	unsigned int ctl1;
++	unsigned int ctl2;
++
++	/* The codec runs from MCLK: BCLK = MCLK / 4, LRCK = BCLK / (2 * slot) */
++	if (!priv->mclk || priv->mclk % (8 * rate)) {
++		dev_err(dai->dev, "MCLK %u Hz does not fit %u Hz\n",
++			priv->mclk, rate);
++		return -EINVAL;
++	}
++
++	switch (priv->mclk / (8 * rate)) {
++	case 16:
++		ctl2 = RK3128_DAC_WL_16;
++		break;
++	case 20:
++		ctl2 = RK3128_DAC_WL_20;
++		break;
++	case 24:
++		ctl2 = RK3128_DAC_WL_24;
++		break;
++	case 32:
++		ctl2 = RK3128_DAC_WL_32;
++		break;
++	default:
++		dev_err(dai->dev, "MCLK %u Hz does not fit %u Hz\n",
++			priv->mclk, rate);
++		return -EINVAL;
++	}
++
++	switch (params_width(params)) {
++	case 16:
++		ctl1 = RK3128_DAC_VWL_16;
++		break;
++	case 20:
++		ctl1 = RK3128_DAC_VWL_20;
++		break;
++	case 24:
++		ctl1 = RK3128_DAC_VWL_24;
++		break;
++	case 32:
++		ctl1 = RK3128_DAC_VWL_32;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	regmap_update_bits(priv->regmap, RK3128_DAC_INT_CTL1,
++			   RK3128_DAC_VWL_MASK | RK3128_DAC_SWAP, ctl1);
++	regmap_update_bits(priv->regmap, RK3128_DAC_INT_CTL2,
++			   RK3128_DAC_WL_MASK | RK3128_DAC_RUN,
++			   ctl2 | RK3128_DAC_RUN);
++
++	return 0;
++}
++
++static const struct snd_soc_dai_ops rk3128_dai_ops = {
++	.set_sysclk	= rk3128_set_dai_sysclk,
++	.set_fmt	= rk3128_set_dai_fmt,
++	.hw_params	= rk3128_hw_params,
++};
++
++static struct snd_soc_dai_driver rk3128_dai = {
++	.name = "rk3128-hifi",
++	.playback = {
++		.stream_name	= "Playback",
++		.channels_min	= 2,
++		.channels_max	= 2,
++		.rates		= SNDRV_PCM_RATE_8000_96000,
++		.formats	= SNDRV_PCM_FMTBIT_S16_LE |
++				  SNDRV_PCM_FMTBIT_S20_3LE |
++				  SNDRV_PCM_FMTBIT_S24_LE |
++				  SNDRV_PCM_FMTBIT_S32_LE,
++	},
++	.ops = &rk3128_dai_ops,
++};
++
++static const struct snd_soc_component_driver rk3128_component = {
++	.controls		= rk3128_controls,
++	.num_controls		= ARRAY_SIZE(rk3128_controls),
++	.dapm_widgets		= rk3128_dapm_widgets,
++	.num_dapm_widgets	= ARRAY_SIZE(rk3128_dapm_widgets),
++	.dapm_routes		= rk3128_dapm_routes,
++	.num_dapm_routes	= ARRAY_SIZE(rk3128_dapm_routes),
++	.endianness		= 1,
++};
++
++static const struct regmap_config rk3128_regmap_config = {
++	.reg_bits	= 32,
++	.reg_stride	= 4,
++	.val_bits	= 32,
++	.max_register	= RK3128_MAX_REGISTER,
++};
++
++static int rk3128_codec_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct rk3128_codec *priv;
++	void __iomem *base;
++
++	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	platform_set_drvdata(pdev, priv);
++
++	base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(base))
++		return PTR_ERR(base);
++
++	priv->regmap = devm_regmap_init_mmio(dev, base, &rk3128_regmap_config);
++	if (IS_ERR(priv->regmap))
++		return dev_err_probe(dev, PTR_ERR(priv->regmap),
++				     "cannot create regmap\n");
++
++	priv->pclk = devm_clk_get_enabled(dev, "pclk");
++	if (IS_ERR(priv->pclk))
++		return dev_err_probe(dev, PTR_ERR(priv->pclk),
++				     "cannot enable pclk\n");
++
++	/* Reset all registers, then release the codec */
++	regmap_write(priv->regmap, RK3128_RESET, 0x00);
++	usleep_range(10000, 11000);
++	regmap_write(priv->regmap, RK3128_RESET, 0x43);
++	usleep_range(10000, 11000);
++
++	priv->gain = RK3128_HPOUT_GAIN_DEFAULT;
++
++	return devm_snd_soc_register_component(dev, &rk3128_component,
++					       &rk3128_dai, 1);
++}
++
++static const struct of_device_id rk3128_codec_of_match[] = {
++	{ .compatible = "rockchip,rk3128-codec", },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, rk3128_codec_of_match);
++
++static struct platform_driver rk3128_codec_driver = {
++	.driver = {
++		.name = "rk3128-codec",
++		.of_match_table = rk3128_codec_of_match,
++	},
++	.probe = rk3128_codec_probe,
++};
++module_platform_driver(rk3128_codec_driver);
++
++MODULE_DESCRIPTION("Rockchip RK3128/RK3126 internal audio codec driver");
++MODULE_LICENSE("GPL");

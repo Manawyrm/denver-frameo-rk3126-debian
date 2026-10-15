@@ -13,6 +13,8 @@
  *   touch       GSL3673 on I2C0 0x40, IRQ GPIO2_C3, power GPIO2_C2
  *   buttons     SARADC channel 2 (volume up/down), power GPIO2_B6
  *   WiFi        RK915 on SDIO, power GPIO1_B0, wakeup GPIO2_C1
+ *   audio       internal codec on the 2-channel I2S, speaker amplifier
+ *               enable GPIO2_C0
  *   power off   GPIO2_B5 (power hold, active low = off)
  *
  * vdd_arm comes from a PWM controlled DC/DC converter on PWM1, vdd_logic
@@ -266,6 +268,68 @@
 	non-removable;
 	no-sd;
 	no-sdio;
+	status = "okay";
+};
+
+/*
+ * Audio: the internal codec (inno_rk3128, kernel patch 0004) gets its
+ * data and MCLK from the 2-channel I2S inside the SoC, its output stage
+ * drives two speaker amplifiers (marked 4890, LM4890 class AB, one per
+ * speaker), both switched with GPIO2_C0 (stock device tree: spk_ctl_io).
+ * DAPM powers the codec first, then the amplifiers.
+ *
+ * Open problem: playback works, but sounds heavily distorted (strong
+ * harmonics on a sine, at any volume). The I2S format, clocks and codec
+ * register sequence match the vendor driver; the cause is not found yet,
+ * the analog side (amplifier supply and bias) still needs measuring.
+ *
+ * The RK3126 has no 8-channel I2S and no SPDIF: every access to
+ * 0x10200000 and 0x10204000 ends in a bus error. The stock device tree
+ * (RK3128 SDK) names i2s_8ch for the codec, but enables the 2-channel
+ * I2S without pins, which is the internal connection.
+ */
+/ {
+	acodec: audio-codec@20030000 {
+		compatible = "rockchip,rk3128-codec";
+		reg = <0x20030000 0x4000>;
+		clocks = <&cru PCLK_ACODEC>;
+		clock-names = "pclk";
+		#sound-dai-cells = <0>;
+	};
+
+	speaker_amp: audio-amplifier {
+		compatible = "simple-audio-amplifier";
+		enable-gpios = <&gpio2 RK_PC0 GPIO_ACTIVE_HIGH>;
+		sound-name-prefix = "Speaker Amp";
+	};
+
+	sound {
+		compatible = "simple-audio-card";
+		simple-audio-card,name = "Frame";
+		simple-audio-card,format = "i2s";
+		simple-audio-card,mclk-fs = <256>;
+		simple-audio-card,widgets = "Speaker", "Speaker";
+		simple-audio-card,routing =
+			"Speaker Amp INL", "HPOUTL",
+			"Speaker Amp INR", "HPOUTR",
+			"Speaker", "Speaker Amp OUTL",
+			"Speaker", "Speaker Amp OUTR";
+		simple-audio-card,aux-devs = <&speaker_amp>;
+
+		simple-audio-card,cpu {
+			sound-dai = <&i2s_2ch>;
+		};
+
+		simple-audio-card,codec {
+			sound-dai = <&acodec>;
+		};
+	};
+};
+
+/* Internal connection to the codec, not the external I2S pins */
+&i2s_2ch {
+	/delete-property/ pinctrl-names;
+	/delete-property/ pinctrl-0;
 	status = "okay";
 };
 
