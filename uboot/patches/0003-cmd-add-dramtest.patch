@@ -1,0 +1,453 @@
+From: picture-frame build
+Subject: [PATCH] cmd: add dramtest
+
+A DRAM test that does not test the caches: every test writes the whole
+range (by default all DRAM below U-Boot's stack) before reading it back,
+with the data cache cleaned and invalidated in between. Used to qualify
+DRAM frequencies.
+---
+diff --git a/cmd/dramtest.c b/cmd/dramtest.c
+new file mode 100644
+--- /dev/null
++++ b/cmd/dramtest.c
+@@ -0,0 +1,410 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * dramtest: a DRAM test that the caches cannot fool
++ *
++ * Every test first writes the whole range and only then reads it back, with
++ * the data cache cleaned and invalidated in between, so every word makes the
++ * round trip through the DRAM. The default range is all DRAM below U-Boot's
++ * stack, far larger than the L1 and L2 caches.
++ *
++ * With the data cache on, cache line fills and write-backs give the highest
++ * bus load, which shows marginal DRAM timing first. "-u" runs everything
++ * with the data cache off (single uncached accesses).
++ *
++ *   bus      data lines (walking 1/0) and address lines on single words
++ *   random   pseudo-random data, then its complement
++ *   address  every word holds its own address, then the complement
++ *   copy     random data in the lower half, memcpy to the upper half
++ *   march    moving inversions: up read/write complement, down back
++ */
++
++#include <command.h>
++#include <console.h>
++#include <cpu_func.h>
++#include <time.h>
++#include <vsprintf.h>
++#include <asm/global_data.h>
++#include <asm/io.h>
++#include <linux/sizes.h>
++
++DECLARE_GLOBAL_DATA_PTR;
++
++/*
++ * Room left below U-Boot's stack: U-Boot reserves CONFIG_STACK_SIZE below
++ * the initial stack pointer, and keeps a few more pages right below that
++ */
++#define DRAMTEST_STACK_GAP	(CONFIG_STACK_SIZE + SZ_1M)
++/* Error lines printed per test, all errors are counted */
++#define DRAMTEST_MAX_REPORTS	16
++/* Check for Ctrl-C after this many words */
++#define DRAMTEST_CTRLC_WORDS	(SZ_1M / 4)
++
++struct dramtest {
++	u32 *start;
++	ulong words;
++	bool uncached;
++	ulong errors;
++	ulong reported;
++	u32 bad_bits;
++	bool aborted;
++};
++
++static u32 next_random(u32 *state)
++{
++	u32 x = *state;
++
++	x ^= x << 13;
++	x ^= x >> 17;
++	x ^= x << 5;
++	*state = x;
++
++	return x;
++}
++
++/* Write back and drop all cached data: the next reads come from the DRAM */
++static void drop_cache(struct dramtest *t)
++{
++	if (!t->uncached)
++		flush_dcache_all();
++}
++
++static void report(struct dramtest *t, u32 *address, u32 expected, u32 read)
++{
++	t->errors++;
++	t->bad_bits |= expected ^ read;
++
++	if (t->reported < DRAMTEST_MAX_REPORTS) {
++		printf("\n  error at %p: expected %08x, read %08x (xor %08x)",
++		       address, expected, read, expected ^ read);
++		t->reported++;
++	}
++}
++
++static bool check_abort(struct dramtest *t, ulong i)
++{
++	if ((i % DRAMTEST_CTRLC_WORDS) == 0 && ctrlc()) {
++		t->aborted = true;
++		return true;
++	}
++
++	return false;
++}
++
++static void print_rate(const char *what, ulong bytes, ulong ms)
++{
++	if (ms == 0)
++		ms = 1;
++
++	printf(" %s %lu MB/s", what, (bytes / ms) / 1000);
++}
++
++static void test_bus(struct dramtest *t)
++{
++	u32 *word = t->start;
++	u32 *other = t->start + 1;
++	ulong offset;
++	int bit;
++	int i;
++
++	/* Data lines: one bit set, then one bit cleared */
++	for (bit = 0; bit < 32; bit++) {
++		u32 patterns[2] = { BIT(bit), ~BIT(bit) };
++
++		for (i = 0; i < 2; i++) {
++			writel(patterns[i], word);
++			/* Drive the other value onto the bus in between */
++			writel(~patterns[i], other);
++			drop_cache(t);
++			if (readl(word) != patterns[i])
++				report(t, word, patterns[i], readl(word));
++		}
++	}
++
++	/*
++	 * Address lines: a marker at every power-of-two word offset, then
++	 * one offset after the other set to the complement. A stuck or
++	 * shorted address line makes two of them the same word.
++	 */
++	for (offset = 1; offset < t->words; offset <<= 1)
++		writel(0xaaaaaaaa, t->start + offset);
++	writel(0x55555555, t->start);
++	drop_cache(t);
++
++	for (offset = 1; offset < t->words; offset <<= 1) {
++		if (readl(t->start + offset) != 0xaaaaaaaa)
++			report(t, t->start + offset, 0xaaaaaaaa,
++			       readl(t->start + offset));
++	}
++
++	for (offset = 1; offset < t->words; offset <<= 1) {
++		ulong other_offset;
++
++		writel(0x55555555, t->start + offset);
++		drop_cache(t);
++		for (other_offset = 1; other_offset < t->words;
++		     other_offset <<= 1) {
++			u32 expected = other_offset == offset ?
++				       0x55555555 : 0xaaaaaaaa;
++			u32 *address = t->start + other_offset;
++
++			if (readl(address) != expected)
++				report(t, address, expected, readl(address));
++		}
++		writel(0xaaaaaaaa, t->start + offset);
++	}
++}
++
++static void fill_random(struct dramtest *t, u32 *start, ulong words,
++			u32 seed, u32 invert)
++{
++	u32 state = seed;
++	ulong i;
++
++	for (i = 0; i < words; i++) {
++		if (check_abort(t, i))
++			return;
++		start[i] = next_random(&state) ^ invert;
++	}
++}
++
++static void verify_random(struct dramtest *t, u32 *start, ulong words,
++			  u32 seed, u32 invert)
++{
++	u32 state = seed;
++	ulong i;
++
++	for (i = 0; i < words; i++) {
++		u32 expected = next_random(&state) ^ invert;
++		u32 read;
++
++		if (check_abort(t, i))
++			return;
++		read = start[i];
++		if (read != expected)
++			report(t, &start[i], expected, read);
++	}
++}
++
++/* Data and its complement, so every bit is tested as 0 and as 1 */
++static const u32 inversions[2] = { 0, ~0 };
++
++static void test_random(struct dramtest *t, u32 seed)
++{
++	ulong bytes = t->words * 4;
++	ulong time;
++	int i;
++
++	for (i = 0; i < 2 && !t->aborted; i++) {
++		time = get_timer(0);
++		fill_random(t, t->start, t->words, seed, inversions[i]);
++		print_rate("write", bytes, get_timer(time));
++		drop_cache(t);
++
++		time = get_timer(0);
++		verify_random(t, t->start, t->words, seed, inversions[i]);
++		print_rate("read", bytes, get_timer(time));
++		drop_cache(t);
++	}
++}
++
++static void test_address(struct dramtest *t)
++{
++	ulong i;
++	int pass;
++
++	for (pass = 0; pass < 2; pass++) {
++		u32 invert = inversions[pass];
++
++		for (i = 0; i < t->words; i++) {
++			if (check_abort(t, i))
++				return;
++			t->start[i] = (u32)(ulong)&t->start[i] ^ invert;
++		}
++		drop_cache(t);
++
++		for (i = 0; i < t->words; i++) {
++			u32 expected = (u32)(ulong)&t->start[i] ^ invert;
++
++			if (check_abort(t, i))
++				return;
++			if (t->start[i] != expected)
++				report(t, &t->start[i], expected, t->start[i]);
++		}
++		drop_cache(t);
++	}
++}
++
++static void test_copy(struct dramtest *t, u32 seed)
++{
++	ulong half = t->words / 2;
++	u32 *upper = t->start + half;
++	ulong time;
++
++	fill_random(t, t->start, half, seed, 0);
++	drop_cache(t);
++	if (t->aborted)
++		return;
++
++	time = get_timer(0);
++	memcpy(upper, t->start, half * 4);
++	print_rate("memcpy", half * 4, get_timer(time));
++	drop_cache(t);
++
++	verify_random(t, upper, half, seed, 0);
++	drop_cache(t);
++}
++
++static void test_march(struct dramtest *t, u32 pattern)
++{
++	ulong i;
++
++	for (i = 0; i < t->words; i++) {
++		if (check_abort(t, i))
++			return;
++		t->start[i] = pattern;
++	}
++	drop_cache(t);
++
++	/* Upwards: read the pattern, write the complement */
++	for (i = 0; i < t->words; i++) {
++		if (check_abort(t, i))
++			return;
++		if (t->start[i] != pattern)
++			report(t, &t->start[i], pattern, t->start[i]);
++		t->start[i] = ~pattern;
++	}
++	drop_cache(t);
++
++	/* Downwards: read the complement, write the pattern */
++	for (i = t->words; i > 0; i--) {
++		if (check_abort(t, i))
++			return;
++		if (t->start[i - 1] != ~pattern)
++			report(t, &t->start[i - 1], ~pattern, t->start[i - 1]);
++		t->start[i - 1] = pattern;
++	}
++	drop_cache(t);
++
++	for (i = 0; i < t->words; i++) {
++		if (check_abort(t, i))
++			return;
++		if (t->start[i] != pattern)
++			report(t, &t->start[i], pattern, t->start[i]);
++	}
++	drop_cache(t);
++}
++
++static int run_test(struct dramtest *t, const char *name,
++		    void (*test)(struct dramtest *t, u32 arg), u32 arg)
++{
++	ulong errors_before = t->errors;
++	ulong time = get_timer(0);
++
++	t->reported = 0;
++	printf("  %-8s", name);
++	test(t, arg);
++
++	if (t->aborted) {
++		printf("\naborted\n");
++		return -1;
++	}
++
++	printf("  %s, %lu ms\n",
++	       t->errors == errors_before ? "ok" : "FAILED", get_timer(time));
++
++	return 0;
++}
++
++static void run_bus(struct dramtest *t, u32 arg)
++{
++	test_bus(t);
++}
++
++static void run_address(struct dramtest *t, u32 arg)
++{
++	test_address(t);
++}
++
++static int do_dramtest(struct cmd_tbl *cmdtp, int flag, int argc,
++		       char *const argv[])
++{
++	struct dramtest t = { 0 };
++	ulong passes = 1;
++	ulong pass;
++	ulong start;
++	ulong end;
++	bool dcache_was_on = dcache_status();
++
++	if (argc > 1 && !strcmp(argv[1], "-u")) {
++		t.uncached = true;
++		argc--;
++		argv++;
++	}
++
++	if (argc > 1)
++		passes = dectoul(argv[1], NULL);
++
++	if (argc > 3) {
++		start = hextoul(argv[2], NULL);
++		end = start + hextoul(argv[3], NULL);
++	} else {
++		start = gd->ram_base;
++		end = ALIGN_DOWN(gd->start_addr_sp - DRAMTEST_STACK_GAP, SZ_1M);
++	}
++
++	if (end <= start + SZ_1M || (start & 3)) {
++		printf("bad range 0x%08lx...0x%08lx\n", start, end);
++		return CMD_RET_USAGE;
++	}
++
++	t.start = (u32 *)start;
++	t.words = (end - start) / 4;
++
++	if (t.uncached)
++		dcache_disable();
++	else if (!dcache_was_on)
++		dcache_enable();
++
++	printf("dramtest 0x%08lx...0x%08lx (%lu MiB), data cache %s, %lu pass(es)%s\n",
++	       start, end - 1, (end - start) >> 20,
++	       t.uncached ? "off" : "on", passes, passes ? "" : " = until Ctrl-C");
++
++	for (pass = 1; passes == 0 || pass <= passes; pass++) {
++		u32 seed = 0x2545f491 * pass + get_timer(0);
++
++		if (seed == 0)
++			seed = 1;
++
++		printf("pass %lu (seed %08x)\n", pass, seed);
++		if (run_test(&t, "bus", run_bus, 0) ||
++		    run_test(&t, "random", test_random, seed) ||
++		    run_test(&t, "address", run_address, 0) ||
++		    run_test(&t, "copy", test_copy, seed ^ 0xa5a5a5a5) ||
++		    run_test(&t, "march", test_march, 0x5aa5c33c))
++			break;
++		printf("after pass %lu: %lu error(s)\n", pass, t.errors);
++	}
++
++	if (dcache_was_on && !dcache_status())
++		dcache_enable();
++	else if (!dcache_was_on && dcache_status())
++		dcache_disable();
++
++	if (t.errors) {
++		printf("dramtest: %lu error(s), failing bits %08x\n",
++		       t.errors, t.bad_bits);
++		return CMD_RET_FAILURE;
++	}
++
++	printf("dramtest: no errors\n");
++
++	return t.aborted ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
++}
++
++U_BOOT_CMD(dramtest, 5, 0, do_dramtest,
++	   "DRAM test, every word through the DRAM (not the cache)",
++	   "[-u] [passes] [start size]\n"
++	   "    -u      data cache off (default: on, highest bus load)\n"
++	   "    passes  number of passes, 0 = until Ctrl-C (default 1)\n"
++	   "    start size  range in hex (default: all DRAM below U-Boot)"
++);
+diff --git a/cmd/Kconfig b/cmd/Kconfig
+--- a/cmd/Kconfig
++++ b/cmd/Kconfig
+@@ -1011,6 +1011,15 @@
+ 	help
+ 	  random - fill memory with random data
+ 
++config CMD_DRAMTEST
++	bool "dramtest"
++	help
++	  DRAM test that cannot be fooled by the caches: every test writes
++	  the whole range first and verifies it afterwards, with the data
++	  cache cleaned and invalidated in between. Tests data and address
++	  lines, random data, address-in-address, memcpy and moving
++	  inversions, with the data cache on (highest bus load) or off.
++
+ config CMD_MEMTEST
+ 	bool "memtest"
+ 	help
+diff --git a/cmd/Makefile b/cmd/Makefile
+--- a/cmd/Makefile
++++ b/cmd/Makefile
+@@ -111,6 +111,7 @@
+ obj-$(CONFIG_CMD_LOG) += log.o
+ obj-$(CONFIG_CMD_LSBLK) += lsblk.o
+ obj-$(CONFIG_CMD_MD5SUM) += md5sum.o
++obj-$(CONFIG_CMD_DRAMTEST) += dramtest.o
+ obj-$(CONFIG_CMD_MEMORY) += mem.o
+ obj-$(CONFIG_CMD_MEMINFO) += meminfo.o
+ obj-$(CONFIG_CMD_IO) += io.o

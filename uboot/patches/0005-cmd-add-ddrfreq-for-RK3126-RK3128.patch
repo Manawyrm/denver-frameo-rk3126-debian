@@ -1,0 +1,1067 @@
+From: picture-frame build
+Subject: [PATCH] cmd: add ddrfreq for the RK3126/RK3128
+
+Change the DDR3 clock from U-Boot: a port of the DDR frequency change of
+the Rockchip 3.10 kernel (ddr_rk3126b.c). It runs from the on-chip SRAM
+with the DRAM in self-refresh and the MMU off, reprograms the DPLL, the
+PCTL and NoC timings, the PHY and the DRAM mode registers, and does a
+data training. "ddrfreq check" compares the timings computed for the
+current clock with the registers the Rockchip DDR init wrote.
+---
+diff --git a/cmd/Kconfig b/cmd/Kconfig
+--- a/cmd/Kconfig
++++ b/cmd/Kconfig
+@@ -1011,6 +1011,15 @@
+ 	help
+ 	  random - fill memory with random data
+ 
++config CMD_RK3128_DDRFREQ
++	bool "ddrfreq (RK3126/RK3128 DDR3 clock)"
++	depends on ROCKCHIP_RK3128
++	help
++	  Show or change the DDR3 clock of the RK3126/RK3128 from U-Boot. The
++	  change runs from the on-chip SRAM, with the DRAM in self-refresh
++	  (port of the Rockchip 3.10 kernel's DDR frequency change). Qualify
++	  every new clock with dramtest.
++
+ config CMD_DRAMTEST
+ 	bool "dramtest"
+ 	help
+diff --git a/cmd/Makefile b/cmd/Makefile
+--- a/cmd/Makefile
++++ b/cmd/Makefile
+@@ -112,6 +112,10 @@
+ obj-$(CONFIG_CMD_LSBLK) += lsblk.o
+ obj-$(CONFIG_CMD_MD5SUM) += md5sum.o
+ obj-$(CONFIG_CMD_DRAMTEST) += dramtest.o
++obj-$(CONFIG_CMD_RK3128_DDRFREQ) += rk3128_ddrfreq.o
++# The SRAM code is copied from ddrfreq_sram() up to ddrfreq_sram_end():
++# keep the functions in source order, no library calls inside
++CFLAGS_rk3128_ddrfreq.o += -fno-toplevel-reorder -fno-tree-loop-distribute-patterns
+ obj-$(CONFIG_CMD_MEMORY) += mem.o
+ obj-$(CONFIG_CMD_MEMINFO) += meminfo.o
+ obj-$(CONFIG_CMD_IO) += io.o
+diff --git a/cmd/rk3128_ddrfreq.c b/cmd/rk3128_ddrfreq.c
+new file mode 100644
+--- /dev/null
++++ b/cmd/rk3128_ddrfreq.c
+@@ -0,0 +1,1019 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * ddrfreq: change the DDR3 clock of the RK3126/RK3128 at run time
++ *
++ * Port of the DDR frequency change of the Rockchip 3.10 kernel
++ * (arch/arm/mach-rockchip/ddr_rk3126b.c, "version 1.02 20140828"), DDR3
++ * only. The Rockchip DDR init (rk3126_ddr_300MHz) leaves the DRAM at
++ * 300 MHz; its PCTL, PHY and NoC timings match the formulas used here.
++ *
++ * The change itself runs from the 8 KiB on-chip SRAM with a stack there:
++ * the DRAM is in self-refresh while the DPLL, the PCTL timings, the PHY
++ * and the DRAM mode registers are reprogrammed. The MMU and data cache
++ * are off during the change, so no cache line is written back meanwhile.
++ *
++ * Above 533 MHz the vendor tables end (the stock firmware only uses
++ * 396 MHz): 666 MHz uses CL 10 / CWL 7 from the vendor table, above that
++ * CL 11 / CWL 8 (DDR3-1600). Qualify every clock with dramtest.
++ */
++
++#include <command.h>
++#include <cpu_func.h>
++#include <vsprintf.h>
++#include <asm/io.h>
++#include <linux/errno.h>
++#include <linux/sizes.h>
++#include <linux/string.h>
++
++#define CRU_BASE		0x20000000
++#define CRU_DPLL_CON0		(CRU_BASE + 0x10)
++#define CRU_DPLL_CON1		(CRU_BASE + 0x14)
++#define CRU_MODE_CON		(CRU_BASE + 0x40)
++#define CRU_CLKSEL26_CON	(CRU_BASE + 0xac)
++#define CRU_CLKGATE_CON(n)	(CRU_BASE + 0xd0 + (n) * 4)
++#define CRU_CLKGATE_COUNT	11
++
++#define GRF_BASE		0x20008000
++#define GRF_SOC_CON2		(GRF_BASE + 0x148)
++#define GRF_SOC_STATUS0		(GRF_BASE + 0x14c)
++#define GRF_OS_REG1		(GRF_BASE + 0x1cc)
++
++#define PMU_PWRDN_ST		0x100a0008
++
++/* Console UART (UART2) for the progress markers of the SRAM code */
++#define UART_THR		0x20068000
++#define UART_LSR		0x20068014
++#define UART_LSR_THRE		BIT(5)
++#define NOC_DDR_TIMING		0x1012800c
++
++#define SRAM_BASE		0x10080000
++#define SRAM_SIZE		SZ_8K
++/*
++ * DRAM area the SRAM code tests at the new clock before it returns to code
++ * in the DRAM; 16 MiB above the start, unused by U-Boot at the prompt
++ */
++#define DRAM_CHECK_BASE		0x61000000
++#define DRAM_CHECK_SIZE		SZ_256K
++
++/* Code at the start, parameters and stack at the end of the SRAM */
++#define SRAM_CODE_MAX		(SZ_4K + SZ_2K)
++#define SRAM_PARAM		(SRAM_BASE + SRAM_CODE_MAX)
++#define SRAM_STACK_TOP		(SRAM_BASE + SRAM_SIZE)
++
++/* DDR controller (PCTL) */
++#define PCTL_BASE		0x20004000
++#define PCTL_SCTL		(PCTL_BASE + 0x04)
++#define PCTL_STAT		(PCTL_BASE + 0x08)
++#define PCTL_MCMD		(PCTL_BASE + 0x40)
++#define PCTL_MCFG		(PCTL_BASE + 0x80)
++#define PCTL_TOGCNT1U		(PCTL_BASE + 0xc0)
++#define PCTL_TOGCNT100N		(PCTL_BASE + 0xcc)
++#define PCTL_TREFI		(PCTL_BASE + 0xd0)
++#define PCTL_TAL		(PCTL_BASE + 0xe4)
++#define PCTL_TCL		(PCTL_BASE + 0xe8)
++#define PCTL_TCWL		(PCTL_BASE + 0xec)
++#define PCTL_TZQCSI		(PCTL_BASE + 0x11c)
++#define PCTL_DFITPHYWRLAT	(PCTL_BASE + 0x254)
++#define PCTL_DFITRDDATAEN	(PCTL_BASE + 0x260)
++/* 34 timing registers from TOGCNT1U (0xc0) to TDPD (0x144) */
++#define PCTL_TIMING_COUNT	34
++
++/* SCTL commands and STAT states */
++#define SCTL_CFG		1
++#define SCTL_GO			2
++#define SCTL_SLEEP		3
++#define SCTL_WAKEUP		4
++#define STAT_INIT_MEM		0
++#define STAT_CONFIG		1
++#define STAT_ACCESS		3
++#define STAT_LOW_POWER		5
++
++/* MCMD: memory commands */
++#define MCMD_START		BIT(31)
++#define MCMD_RANKS_ALL		(3 << 20)
++#define MCMD_PREA		1
++#define MCMD_REF		2
++#define MCMD_MRS		3
++#define MCMD_BANK(n)		((n) << 17)
++#define MCMD_ADDR(n)		((n) << 4)
++
++/* MCFG: burst length 8, tFAW = 5 * tRRD, slow power-down exit, type 1 */
++#define MCFG_TIMING_MASK	(0x1 | (0x3 << 18) | BIT(17) | BIT(16))
++#define MCFG_TIMING		(0x1 | (1 << 18) | BIT(16))
++
++/* DDR PHY */
++#define PHY_BASE		0x2000a000
++#define PHY_REG1		(PHY_BASE + 0x000)
++#define PHY_REG2		(PHY_BASE + 0x008)
++#define PHY_REG4A		(PHY_BASE + 0x038)
++#define PHY_REG16		(PHY_BASE + 0x054)
++#define PHY_REG22		(PHY_BASE + 0x070)
++#define PHY_REG25		(PHY_BASE + 0x080)
++#define PHY_REG26		(PHY_BASE + 0x084)
++#define PHY_REG27		(PHY_BASE + 0x088)
++#define PHY_REG28		(PHY_BASE + 0x08c)
++#define PHY_REG8		(PHY_BASE + 0x0e0)
++#define PHY_REG11		(PHY_BASE + 0x120)
++#define PHY_REG264		(PHY_BASE + 0x264)
++#define PHY_REG2A		(PHY_BASE + 0x2b0)
++#define PHY_REG62		(PHY_BASE + 0x3e8)
++
++#define PHY_SOFT_RESET_ANALOG	BIT(2)
++#define PHY_SOFT_RESET_DIGITAL	BIT(3)
++#define PHY_AUTO_CALIBRATION	BIT(0)
++#define PHY_DRV_ODT(n)		(((n) << 4) | (n))
++#define PHY_RON_44OHM		11
++#define PHY_RTT_DISABLE		0
++#define PHY_RTT_216OHM		4
++
++/* Below these clocks the PHY DLL is bypassed, the PHY ODT and the DRAM ODT
++ * are off, the DRAM DLL is off (vendor values) */
++#define PHY_DLL_DISABLE_MHZ	266
++#define PHY_ODT_DISABLE_MHZ	333
++#define DRAM_ODT_DISABLE_MHZ	333
++#define DRAM_DLL_DISABLE_MHZ	300
++
++/* DDR3 mode registers */
++#define DDR3_MR0_BL8		0
++#define DDR3_MR0_CL(n)		(((((n) - 4) & 0x7) << 4) | ((((n) - 4) & 0x8) >> 1))
++#define DDR3_MR0_WR(n)		(((n) & 0x7) << 9)
++#define DDR3_MR0_DLL_RESET	BIT(8)
++#define DDR3_MR1_DLL_DISABLE	BIT(0)
++#define DDR3_MR1_DS_40		0
++#define DDR3_MR1_RTT_NOM_120	BIT(6)
++#define DDR3_MR2_CWL(n)		((((n) - 5) & 0x7) << 3)
++
++/* DDR3 timings in ns, from the vendor driver */
++#define DDR3_TREFI_100NS	78
++#define DDR3_TMRD_TCK		4
++#define DDR3_TRAS		37
++#define DDR3_TRRD		10
++#define DDR3_TRTP		7
++#define DDR3_TWR		15
++#define DDR3_TWTR		7
++#define DDR3_TXP		7
++#define DDR3_TXPDLL		24
++#define DDR3_TZQCS		80
++#define DDR3_TZQCSI		10000
++#define DDR3_TCKSRE		10
++#define DDR3_TCKE_400MHZ	7
++#define DDR3_TCKE_533MHZ	6
++#define DDR3_TMOD		15
++#define DDR3_TRSTL		100
++#define DDR3_TZQCL		320
++#define DDR3_TDLLK_TCK		512
++/* "DDR3_DEFAULT" speed bin of the vendor tables */
++#define DDR3_TRC		53
++
++struct ddrfreq_param {
++	u32 mhz;
++	u32 verbose;
++	u32 up;
++	u32 dram_dll_on_before;
++	u32 dram_dll_on_after;
++	u32 loops_per_us;
++	u32 dpll_con0;
++	u32 dpll_con1;
++	/* Set by the SRAM code: 0 ok, 1 training failed (fallback used) */
++	u32 result;
++	/* Values of the 34 PCTL timing registers from TOGCNT1U on */
++	u32 timing[PCTL_TIMING_COUNT];
++	u32 noc_timing;
++	u32 mr[3];
++	u32 phy_dll_phase;
++	u32 phy_tx_dll;
++	u32 phy_odt;
++};
++
++/* Index of a PCTL timing register in struct ddrfreq_param.timing */
++#define T(reg)			(((reg) - PCTL_TOGCNT1U) / 4)
++
++/* ns (or 100 ns units for tREFI) to clock cycles, rounded up */
++static u32 ns_to_tck(u32 ns, u32 mhz)
++{
++	return (ns * mhz + 999) / 1000;
++}
++
++/* Same, the vendor's variant for timings with a ".5 ns" fraction */
++static u32 ns5_to_tck(u32 ns, u32 mhz)
++{
++	return (ns * mhz + (mhz >> 1) + 999) / 1000;
++}
++
++static u32 at_least(u32 value, u32 minimum)
++{
++	return value < minimum ? minimum : value;
++}
++
++/*
++ * PLL setup as in the vendor's ddr_set_pll(): the DPLL runs at twice the
++ * DDR clock (ddrphy2x), refdiv 1, integer mode. Returns the DDR clock in
++ * MHz that the dividers give.
++ */
++static u32 ddrfreq_pll(u32 mhz, u32 postdiv1, struct ddrfreq_param *p)
++{
++	u32 fbdiv;
++
++	/* POSTDIV1 0: the vendor's choice */
++	if (postdiv1 == 0) {
++		if (mhz <= 150)
++			postdiv1 = 6;
++		else if (mhz <= 200)
++			postdiv1 = 4;
++		else if (mhz <= 300)
++			postdiv1 = 3;
++		else if (mhz <= 450)
++			postdiv1 = 2;
++		else
++			postdiv1 = 1;
++	}
++
++	fbdiv = (mhz * 2 * postdiv1) / 24;
++
++	/* Hiword masks: FBDIV, POSTDIV1; REFDIV, POSTDIV2, DSMPD (integer) */
++	p->dpll_con0 = (0xfff << 16) | fbdiv | (0x7 << 28) | (postdiv1 << 12);
++	p->dpll_con1 = (0x3f << 16) | 1 | (0x7 << 22) | (1 << 6) | (0x10001 << 12);
++
++	return (24 * fbdiv) / (2 * postdiv1);
++}
++
++/* Current DDR clock in MHz from the DPLL (refdiv/postdiv2 as above) */
++static u32 ddrfreq_current(void)
++{
++	u32 con0 = readl(CRU_DPLL_CON0);
++	u32 con1 = readl(CRU_DPLL_CON1);
++	u32 fbdiv = con0 & 0xfff;
++	u32 postdiv1 = (con0 >> 12) & 0x7;
++	u32 refdiv = con1 & 0x3f;
++	u32 postdiv2 = (con1 >> 6) & 0x7;
++
++	if (!postdiv1 || !refdiv || !postdiv2)
++		return 0;
++
++	return (24 * fbdiv) / (refdiv * postdiv1 * postdiv2 * 2);
++}
++
++/* DRAM capacity per die in bytes, as in the vendor's ddr_init() */
++static u64 ddrfreq_capacity_per_die(void)
++{
++	u32 os_reg1 = readl(GRF_OS_REG1);
++	u32 ranks = ((os_reg1 >> 11) & 0x1) + 1;
++	/* 0: 8 bit, 1: 16 bit, 2: 32 bit (reversed in the GRF) */
++	u32 bus_width = 2 >> ((os_reg1 & 0xc) >> 2);
++	u32 die_width = 2 >> (os_reg1 & 0x3);
++	u32 dies = 1 << (bus_width - die_width);
++
++	return (u64)SZ_1G / (ranks * dies);
++}
++
++/*
++ * The vendor's ddr_get_parameter() for DDR3 with the DDR3_DEFAULT speed
++ * bin, plus a DDR3-1600 step above 666 MHz.
++ */
++static int ddrfreq_parameters(u32 mhz, struct ddrfreq_param *p)
++{
++	u64 die = ddrfreq_capacity_per_die();
++	u32 *t = p->timing;
++	u32 cl;
++	u32 cwl;
++	u32 bl = 8;
++	u32 trfc_ns;
++	u32 tmp;
++
++	if (mhz <= 400) {
++		cl = 6;
++		cwl = 5;
++	} else if (mhz <= 533) {
++		cl = 8;
++		cwl = 6;
++	} else if (mhz <= 666) {
++		cl = 10;
++		cwl = 7;
++	} else if (mhz <= 800) {
++		cl = 11;
++		cwl = 8;
++	} else {
++		return -EINVAL;
++	}
++
++	if (die <= SZ_64M)
++		trfc_ns = 90;
++	else if (die <= SZ_128M)
++		trfc_ns = 110;
++	else if (die <= SZ_256M)
++		trfc_ns = 160;
++	else if (die <= SZ_512M)
++		trfc_ns = 300;
++	else
++		trfc_ns = 350;
++
++	memset(t, 0, sizeof(p->timing));
++	t[T(PCTL_TOGCNT1U)] = mhz;
++	t[T(PCTL_BASE + 0xc4)] = 200;			/* tINIT */
++	t[T(PCTL_BASE + 0xc8)] = 500;			/* tRSTH */
++	t[T(PCTL_TOGCNT100N)] = mhz / 10;
++	t[T(PCTL_TREFI)] = DDR3_TREFI_100NS;
++	t[T(PCTL_BASE + 0xd4)] = DDR3_TMRD_TCK & 0x7;	/* tMRD */
++	t[T(PCTL_BASE + 0xd8)] = ns_to_tck(trfc_ns, mhz);	/* tRFC */
++	t[T(PCTL_BASE + 0xdc)] = cl;			/* tRP */
++	t[T(PCTL_BASE + 0xe0)] = cl + 2 - cwl;		/* tRTW */
++	t[T(PCTL_TAL)] = 0;
++	t[T(PCTL_TCL)] = cl;
++	t[T(PCTL_TCWL)] = cwl;
++	t[T(PCTL_BASE + 0xf0)] = ns5_to_tck(DDR3_TRAS, mhz) & 0x3f;	/* tRAS */
++	t[T(PCTL_BASE + 0xf4)] = ns_to_tck(DDR3_TRC, mhz) & 0x3f;	/* tRC */
++	t[T(PCTL_BASE + 0xf8)] = cl;			/* tRCD */
++	t[T(PCTL_BASE + 0xfc)] = at_least(ns_to_tck(DDR3_TRRD, mhz), 4) & 0xf;
++	t[T(PCTL_BASE + 0x100)] = at_least(ns5_to_tck(DDR3_TRTP, mhz), 4) & 0xf;
++
++	tmp = ns_to_tck(DDR3_TWR, mhz);
++	t[T(PCTL_BASE + 0x104)] = tmp & 0x1f;		/* tWR */
++	/* MR0 write recovery: 5..8 -> 1..4, 10/12/14/16 -> 5/6/7/0 */
++	tmp = tmp < 9 ? tmp - 4 : tmp >> 1;
++	p->mr[0] = DDR3_MR0_BL8 | DDR3_MR0_CL(cl) | DDR3_MR0_WR(tmp);
++
++	t[T(PCTL_BASE + 0x108)] = at_least(ns5_to_tck(DDR3_TWTR, mhz), 4) & 0xf;
++	t[T(PCTL_BASE + 0x10c)] = DDR3_TDLLK_TCK;	/* tXSR */
++	t[T(PCTL_BASE + 0x110)] = at_least(ns5_to_tck(DDR3_TXP, mhz), 3) & 0x7;
++	t[T(PCTL_BASE + 0x114)] = at_least(ns_to_tck(DDR3_TXPDLL, mhz), 10) & 0x3f;
++	t[T(PCTL_BASE + 0x118)] = at_least(ns_to_tck(DDR3_TZQCS, mhz), 64) & 0x7f;
++	t[T(PCTL_TZQCSI)] = DDR3_TZQCSI;
++	t[T(PCTL_BASE + 0x120)] = 1;			/* tDQS */
++
++	tmp = at_least(ns_to_tck(DDR3_TCKSRE, mhz), 5) & 0x1f;
++	t[T(PCTL_BASE + 0x124)] = tmp;			/* tCKSRE */
++	t[T(PCTL_BASE + 0x128)] = tmp;			/* tCKSRX */
++
++	if (mhz >= 533)
++		tmp = ns_to_tck(DDR3_TCKE_533MHZ, mhz);
++	else
++		tmp = ns5_to_tck(DDR3_TCKE_400MHZ, mhz);
++	tmp = at_least(tmp, 3);
++	t[T(PCTL_BASE + 0x12c)] = tmp & 0x7;		/* tCKE */
++	t[T(PCTL_BASE + 0x140)] = (tmp + 1) & 0xf;	/* tCKESR */
++
++	t[T(PCTL_BASE + 0x130)] = at_least(ns_to_tck(DDR3_TMOD, mhz), 12) & 0x1f;
++	t[T(PCTL_BASE + 0x134)] = ns_to_tck(DDR3_TRSTL, mhz) & 0x7f;
++	t[T(PCTL_BASE + 0x138)] = at_least(ns_to_tck(DDR3_TZQCL, mhz), 256) & 0x3ff;
++	/* tMRR, tDPD: 0 */
++
++	if (mhz <= DRAM_ODT_DISABLE_MHZ)
++		p->mr[1] = DDR3_MR1_DS_40;
++	else
++		p->mr[1] = DDR3_MR1_DS_40 | DDR3_MR1_RTT_NOM_120;
++	p->mr[2] = DDR3_MR2_CWL(cwl);
++
++	/* NoC: ActToAct, RdToMiss, WrToMiss, BurstLen, RdToWr, WrToRd */
++	p->noc_timing = (t[T(PCTL_BASE + 0xf4)] & 0x3f) |
++		(((t[T(PCTL_BASE + 0x100)] + cl + cl - (bl >> 1)) & 0x3f) << 6) |
++		(((cwl + ns_to_tck(DDR3_TWR, mhz) + cl + cl) & 0x3f) << 12) |
++		(((bl >> 1) & 0x7) << 18) |
++		(((cl + 2 - cwl) & 0x1f) << 21) |
++		(((t[T(PCTL_BASE + 0x108)] + cwl) & 0x1f) << 26);
++
++	if (mhz < 350)
++		p->phy_dll_phase = 3;
++	else if (mhz < 666)
++		p->phy_dll_phase = 2;
++	else
++		p->phy_dll_phase = 1;
++
++	p->phy_tx_dll = mhz <= PHY_DLL_DISABLE_MHZ ? 0x1f : 0x3;
++	p->phy_odt = mhz <= PHY_ODT_DISABLE_MHZ ? PHY_RTT_DISABLE : PHY_RTT_216OHM;
++	p->dram_dll_on_after = mhz > DRAM_DLL_DISABLE_MHZ;
++
++	return 0;
++}
++
++/*
++ * Everything below runs from the SRAM: one function (all helpers inlined),
++ * no calls out of it, no global data, parameters through the pointer.
++ */
++#define SRAM_INLINE		static inline __attribute__((always_inline))
++
++SRAM_INLINE void sram_delay_us(struct ddrfreq_param *p, u32 us)
++{
++	/* One loop takes at least one CPU cycle: never shorter than us */
++	u32 loops = p->loops_per_us * us;
++
++	asm volatile("1: subs %0, %0, #1\n"
++		     "   bne 1b\n" : "+r"(loops) : : "cc");
++}
++
++/* One character to the console UART, when verbose */
++SRAM_INLINE void sram_mark(struct ddrfreq_param *p, char c)
++{
++	if (!p->verbose)
++		return;
++
++	while (!(readl(UART_LSR) & UART_LSR_THRE))
++		;
++	writel(c, UART_THR);
++}
++
++SRAM_INLINE u32 sram_stat(void)
++{
++	return readl(PCTL_STAT) & 0x7;
++}
++
++SRAM_INLINE void sram_move_to_config(void)
++{
++	/* hw_wakeup: no automatic self-refresh */
++	writel((1 << 16) | 1, GRF_SOC_CON2);
++
++	while (1) {
++		u32 state = sram_stat();
++
++		if (state == STAT_CONFIG)
++			break;
++
++		switch (state) {
++		case STAT_LOW_POWER:
++			writel(SCTL_WAKEUP, PCTL_SCTL);
++			dsb();
++			fallthrough;
++		case STAT_ACCESS:
++		case STAT_INIT_MEM:
++			writel(SCTL_CFG, PCTL_SCTL);
++			dsb();
++			break;
++		default:	/* transitional state */
++			break;
++		}
++	}
++}
++
++SRAM_INLINE void sram_move_to_low_power(void)
++{
++	while (1) {
++		u32 state = sram_stat();
++
++		if (state == STAT_LOW_POWER)
++			break;
++
++		switch (state) {
++		case STAT_INIT_MEM:
++			writel(SCTL_CFG, PCTL_SCTL);
++			dsb();
++			while (sram_stat() != STAT_CONFIG)
++				;
++			fallthrough;
++		case STAT_CONFIG:
++			writel(SCTL_GO, PCTL_SCTL);
++			dsb();
++			while (sram_stat() != STAT_ACCESS)
++				;
++			fallthrough;
++		case STAT_ACCESS:
++			writel(SCTL_SLEEP, PCTL_SCTL);
++			dsb();
++			while (sram_stat() != STAT_LOW_POWER)
++				;
++			break;
++		default:	/* transitional state */
++			break;
++		}
++	}
++}
++
++SRAM_INLINE void sram_move_to_access(void)
++{
++	while (1) {
++		u32 state = sram_stat();
++
++		if (state == STAT_ACCESS)
++			break;
++
++		switch (state) {
++		case STAT_LOW_POWER:
++			writel(SCTL_WAKEUP, PCTL_SCTL);
++			dsb();
++			while (sram_stat() != STAT_ACCESS)
++				;
++			break;
++		case STAT_INIT_MEM:
++			writel(SCTL_CFG, PCTL_SCTL);
++			dsb();
++			while (sram_stat() != STAT_CONFIG)
++				;
++			fallthrough;
++		case STAT_CONFIG:
++			writel(SCTL_GO, PCTL_SCTL);
++			dsb();
++			while (sram_stat() != STAT_ACCESS)
++				;
++			break;
++		default:	/* transitional state */
++			break;
++		}
++	}
++
++	/* hw_wakeup off again (as the vendor driver leaves it) */
++	writel((1 << 16) | 0, GRF_SOC_CON2);
++}
++
++SRAM_INLINE void sram_command(u32 command, u32 argument)
++{
++	while (readl(PCTL_MCMD) & MCMD_START)
++		;
++	writel(MCMD_START | MCMD_RANKS_ALL | argument | command, PCTL_MCMD);
++	dsb();
++}
++
++SRAM_INLINE void sram_mrs(u32 bank, u32 value)
++{
++	sram_command(MCMD_MRS, MCMD_BANK(bank) | MCMD_ADDR(value));
++}
++
++/* Returns 0, or -1 when the PHY did not finish within 100 ms */
++SRAM_INLINE int sram_data_training(struct ddrfreq_param *p)
++{
++	u32 trefi = readl(PCTL_TREFI);
++	u32 timeout;
++
++	writel(0, PCTL_TREFI);
++	setbits_le32(PHY_REG2, PHY_AUTO_CALIBRATION);
++	dsb();
++	sram_delay_us(p, 1);
++
++	for (timeout = 100000; timeout > 0; timeout--) {
++		if ((readl(PHY_REG62) & 0x3) == 0x3)
++			break;
++		sram_delay_us(p, 1);
++	}
++	clrbits_le32(PHY_REG2, PHY_AUTO_CALIBRATION);
++
++	/* Make up for the refreshes lost during the training */
++	sram_command(MCMD_PREA, 0);
++	sram_command(MCMD_REF, 0);
++	sram_command(MCMD_REF, 0);
++
++	writel(trefi, PCTL_TREFI);
++
++	return timeout ? 0 : -1;
++}
++
++SRAM_INLINE void sram_update_timing(struct ddrfreq_param *p, bool keep_togcnt)
++{
++	volatile u32 *reg = (volatile u32 *)PCTL_TOGCNT1U;
++	u32 togcnt1u = readl(PCTL_TOGCNT1U);
++	u32 togcnt100n = readl(PCTL_TOGCNT100N);
++	u32 i;
++
++	for (i = 0; i < PCTL_TIMING_COUNT; i++)
++		reg[i] = p->timing[i];
++
++	/* Going up: the counters stay at the old clock until the change */
++	if (keep_togcnt) {
++		writel(togcnt1u, PCTL_TOGCNT1U);
++		writel(togcnt100n, PCTL_TOGCNT100N);
++	}
++
++	writel((p->timing[T(PCTL_TCL)] << 4) | p->timing[T(PCTL_TAL)], PHY_REG4A);
++	writel(p->noc_timing, NOC_DDR_TIMING);
++	clrsetbits_le32(PCTL_MCFG, MCFG_TIMING_MASK, MCFG_TIMING);
++	writel(readl(PCTL_TAL) + readl(PCTL_TCL) - 3, PCTL_DFITRDDATAEN);
++	writel(readl(PCTL_TCWL) - 1, PCTL_DFITPHYWRLAT);
++}
++
++SRAM_INLINE void sram_update_mr(struct ddrfreq_param *p)
++{
++	if (p->dram_dll_on_after) {
++		if (!p->dram_dll_on_before) {
++			/* DLL off -> on: enable, reset, wait 200+ cycles */
++			sram_mrs(1, p->mr[1]);
++			sram_mrs(0, p->mr[0] | DDR3_MR0_DLL_RESET);
++			sram_delay_us(p, 2);
++			sram_mrs(0, p->mr[0]);
++		} else {
++			sram_mrs(1, p->mr[1]);
++			sram_mrs(0, p->mr[0]);
++		}
++	} else {
++		sram_mrs(1, p->mr[1] | DDR3_MR1_DLL_DISABLE);
++		sram_mrs(0, p->mr[0]);
++	}
++
++	sram_mrs(2, p->mr[2]);
++}
++
++SRAM_INLINE void sram_update_odt(struct ddrfreq_param *p)
++{
++	writel(PHY_DRV_ODT(p->phy_odt), PHY_REG27);	/* DQS0 ODT */
++	writel(PHY_DRV_ODT(p->phy_odt), PHY_REG28);	/* DQS1 ODT */
++	writel(PHY_DRV_ODT(PHY_RON_44OHM), PHY_REG16);	/* command drive */
++	writel(PHY_DRV_ODT(PHY_RON_44OHM), PHY_REG22);	/* clock drive */
++	writel(PHY_DRV_ODT(PHY_RON_44OHM), PHY_REG25);	/* DQS0 drive */
++	writel(PHY_DRV_ODT(PHY_RON_44OHM), PHY_REG26);	/* DQS1 drive */
++	dsb();
++}
++
++/* Ask the bus ports (peri, vio, vpu, gpu if powered) to go idle or back */
++SRAM_INLINE void sram_idle_ports(struct ddrfreq_param *p, bool idle)
++{
++	u32 gates[CRU_CLKGATE_COUNT];
++	u32 powered_off = readl(PMU_PWRDN_ST);
++	u32 request = 0;
++	u32 status = 0;
++	u32 i;
++
++	/* The peripheral port carries the UART: left running when verbose */
++	if (!p->verbose) {
++		request |= BIT(12);
++		status |= BIT(23);
++	}
++
++	if (!(powered_off & BIT(3))) {	/* vio */
++		request |= BIT(11);
++		status |= BIT(24);
++	}
++	if (!(powered_off & BIT(2))) {	/* vpu */
++		request |= BIT(10);
++		status |= BIT(25);
++	}
++	if (!(powered_off & BIT(1))) {	/* gpu */
++		request |= BIT(9);
++		status |= BIT(26);
++	}
++
++	/* The idle handshake needs all clocks running */
++	for (i = 0; i < CRU_CLKGATE_COUNT; i++)
++		gates[i] = readl(CRU_CLKGATE_CON(i));
++	for (i = 0; i < CRU_CLKGATE_COUNT; i++)
++		writel(0xffff0000, CRU_CLKGATE_CON(i));
++
++	writel((request << 16) | (idle ? request : 0), GRF_SOC_CON2);
++	dsb();
++	while ((readl(GRF_SOC_STATUS0) & status) != (idle ? status : 0))
++		;
++
++	for (i = 0; i < CRU_CLKGATE_COUNT; i++)
++		writel(gates[i] | 0xffff0000, CRU_CLKGATE_CON(i));
++}
++
++/*
++ * Quick DRAM check at the new clock (MMU off: single accesses, plus 16-byte
++ * LDM/STM copies): a pattern derived from the address and its complement,
++ * then a copy of the first half to the second half
++ */
++SRAM_INLINE int sram_dram_check(void)
++{
++	volatile u32 *mem = (volatile u32 *)DRAM_CHECK_BASE;
++	u32 words = DRAM_CHECK_SIZE / 4;
++	u32 half = words / 2;
++	u32 pass;
++	u32 i;
++
++	for (pass = 0; pass < 2; pass++) {
++		u32 invert = pass ? ~0 : 0;
++
++		for (i = 0; i < words; i++)
++			mem[i] = (i * 0x9e3779b1) ^ invert;
++		for (i = 0; i < words; i++) {
++			if (mem[i] != ((i * 0x9e3779b1) ^ invert))
++				return -1;
++		}
++	}
++
++	{
++		u32 src = DRAM_CHECK_BASE;
++		u32 dst = DRAM_CHECK_BASE + half * 4;
++		u32 bytes = half * 4;
++
++		asm volatile("1: ldmia %0!, {r3, r4, r5, r6}\n"
++			     "   stmia %1!, {r3, r4, r5, r6}\n"
++			     "   subs %2, %2, #16\n"
++			     "   bne 1b\n"
++			     : "+r"(src), "+r"(dst), "+r"(bytes)
++			     :
++			     : "r3", "r4", "r5", "r6", "memory", "cc");
++	}
++
++	/* The second half now holds the complement pattern of the first */
++	for (i = 0; i < half; i++) {
++		if (mem[half + i] != ((i * 0x9e3779b1) ^ ~0))
++			return -1;
++	}
++
++	return 0;
++}
++
++/*
++ * The vendor's ddr_SRE_2_SRX(). Returns -1 when the data training or the
++ * DRAM check at the new clock fails.
++ */
++SRAM_INLINE int sram_change(struct ddrfreq_param *p)
++{
++	u32 delay;
++
++	sram_mark(p, 'a');
++	sram_idle_ports(p, true);
++	sram_mark(p, 'b');
++	sram_move_to_config();
++	sram_mark(p, 'c');
++
++	/* Before the clock change: longer timings first when going up */
++	if (p->up) {
++		sram_update_timing(p, true);
++		sram_update_mr(p);
++	} else {
++		writel(p->timing[T(PCTL_TOGCNT100N)], PCTL_TOGCNT100N);
++		writel(p->timing[T(PCTL_TOGCNT1U)], PCTL_TOGCNT1U);
++	}
++	writel(0, PCTL_TZQCSI);
++	sram_mark(p, 'd');
++
++	/* DRAM into self-refresh, PHY into reset */
++	sram_move_to_low_power();
++	sram_mark(p, 'e');
++	clrbits_le32(PHY_REG264, BIT(1));
++	clrbits_le32(PHY_REG1, PHY_SOFT_RESET_ANALOG | PHY_SOFT_RESET_DIGITAL);
++	dsb();
++
++	/* DPLL: slow mode, new dividers, wait for lock, normal mode */
++	writel((0x1 << (4 + 16)) | (0x0 << 4), CRU_MODE_CON);
++	writel(p->dpll_con0, CRU_DPLL_CON0);
++	writel(p->dpll_con1, CRU_DPLL_CON1);
++	sram_delay_us(p, 1);
++	for (delay = 1000; delay > 0; delay--) {
++		sram_delay_us(p, 1);
++		if (readl(CRU_DPLL_CON1) & BIT(10))
++			break;
++	}
++	sram_mark(p, delay ? 'f' : 'F');
++	/* clk_ddrphy2x from the DPLL, divider 1 */
++	writel((0x3 << 16) | 0x0, CRU_CLKSEL26_CON);
++	writel((0x1 << (4 + 16)) | (0x1 << 4), CRU_MODE_CON);
++
++	/* PHY DLL mode, then out of reset */
++	writel(p->phy_dll_phase, PHY_REG8);
++	writel(p->phy_dll_phase, PHY_REG11);
++	writel(p->phy_tx_dll, PHY_REG2A);
++	dsb();
++	setbits_le32(PHY_REG1, PHY_SOFT_RESET_ANALOG);
++	sram_delay_us(p, 3);
++	setbits_le32(PHY_REG1, PHY_SOFT_RESET_DIGITAL);
++	setbits_le32(PHY_REG264, BIT(1));
++	dsb();
++	sram_mark(p, 'g');
++
++	sram_update_odt(p);
++	sram_move_to_config();
++	sram_mark(p, 'h');
++
++	/* After the clock change */
++	if (p->up) {
++		writel(p->timing[T(PCTL_TOGCNT100N)], PCTL_TOGCNT100N);
++		writel(p->timing[T(PCTL_TOGCNT1U)], PCTL_TOGCNT1U);
++		writel(p->timing[T(PCTL_TZQCSI)], PCTL_TZQCSI);
++	} else {
++		sram_update_timing(p, false);
++		sram_update_mr(p);
++	}
++	sram_mark(p, 'i');
++	if (sram_data_training(p)) {
++		sram_mark(p, 'T');
++		return -1;
++	}
++	sram_mark(p, 'j');
++
++	sram_move_to_access();
++	sram_mark(p, 'k');
++
++	if (sram_dram_check()) {
++		sram_mark(p, 'M');
++		return -1;
++	}
++	sram_mark(p, 'l');
++
++	sram_idle_ports(p, false);
++	sram_mark(p, 'm');
++
++	return 0;
++}
++
++/*
++ * p[0]: the new clock, p[1]: back to the old one, used when the data
++ * training at the new clock fails
++ */
++static noinline __section(".text.ddrfreq_sram") void
++ddrfreq_sram(struct ddrfreq_param *p)
++{
++	if (sram_change(&p[0]) == 0) {
++		p[0].result = 0;
++		return;
++	}
++
++	p[0].result = 1;
++	sram_mark(p, 'R');
++	sram_change(&p[1]);
++}
++
++
++/* Marks the end of the code copied to the SRAM */
++static noinline __section(".text.ddrfreq_sram") void
++ddrfreq_sram_end(void)
++{
++}
++
++/* Call fn(p) with the stack pointer at the top of the SRAM */
++static void ddrfreq_call_on_sram_stack(ulong fn, struct ddrfreq_param *p)
++{
++	asm volatile("mov r4, sp\n"
++		     "mov sp, %2\n"
++		     "mov r0, %1\n"
++		     "blx %0\n"
++		     "mov sp, r4\n"
++		     :
++		     : "r"(fn), "r"(p), "r"(SRAM_STACK_TOP)
++		     : "r0", "r1", "r2", "r3", "r4", "r12", "lr", "memory", "cc");
++}
++
++static u32 ddrfreq_cpu_mhz(void)
++{
++	/* APLL with the same divider fields as the DPLL; core divider 1 */
++	u32 con0 = readl(CRU_BASE + 0x0);
++	u32 con1 = readl(CRU_BASE + 0x4);
++	u32 postdiv = ((con0 >> 12) & 0x7) * ((con1 >> 6) & 0x7);
++	u32 refdiv = con1 & 0x3f;
++
++	if (!postdiv || !refdiv)
++		return 1200;	/* unknown: assume the fastest, longer delays */
++
++	return (24 * (con0 & 0xfff)) / (refdiv * postdiv);
++}
++
++/*
++ * Compare the timings computed for the current clock with the registers:
++ * after the Rockchip DDR init (300 MHz) they have to match exactly
++ */
++static int ddrfreq_check(u32 current)
++{
++	struct ddrfreq_param param;
++	int mismatches = 0;
++	u32 value;
++	u32 i;
++
++	memset(&param, 0, sizeof(param));
++	if (ddrfreq_parameters(current, &param)) {
++		printf("ddrfreq: no DDR3 timings for %u MHz\n", current);
++		return CMD_RET_FAILURE;
++	}
++
++	for (i = 0; i < PCTL_TIMING_COUNT; i++) {
++		value = readl(PCTL_TOGCNT1U + i * 4);
++		if (value != param.timing[i]) {
++			printf("  PCTL 0x%03x: register %u, computed %u\n",
++			       0xc0 + i * 4, value, param.timing[i]);
++			mismatches++;
++		}
++	}
++
++	value = readl(NOC_DDR_TIMING);
++	if (value != param.noc_timing) {
++		printf("  NoC DDR timing: register 0x%08x, computed 0x%08x\n",
++		       value, param.noc_timing);
++		mismatches++;
++	}
++
++	value = readl(PHY_REG4A);
++	if (value != ((param.timing[T(PCTL_TCL)] << 4) | param.timing[T(PCTL_TAL)])) {
++		printf("  PHY CL/AL: register 0x%02x\n", value);
++		mismatches++;
++	}
++
++	printf("ddrfreq check at %u MHz: %d mismatch(es)\n", current, mismatches);
++
++	return mismatches ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
++}
++
++static int do_ddrfreq(struct cmd_tbl *cmdtp, int flag, int argc,
++		      char *const argv[])
++{
++	/* [0]: the new clock, [1]: back to the current one if that fails */
++	struct ddrfreq_param param[2];
++	struct ddrfreq_param *sram_param = (struct ddrfreq_param *)SRAM_PARAM;
++	/*
++	 * Copied from an 8-byte aligned address: Thumb literal loads are
++	 * relative to the word-aligned PC, the alignment has to stay
++	 */
++	ulong entry = (ulong)ddrfreq_sram & ~1UL;
++	ulong code_start = ALIGN_DOWN(entry, 8);
++	ulong code_size = ((ulong)ddrfreq_sram_end & ~1UL) - code_start;
++	u32 current = ddrfreq_current();
++	bool dcache_was_on = dcache_status();
++	bool verbose = false;
++	u32 postdiv1 = 0;
++	u32 requested;
++	u32 mhz;
++
++	if (argc > 1 && !strcmp(argv[1], "-v")) {
++		verbose = true;
++		argc--;
++		argv++;
++	}
++
++	if (argc < 2) {
++		printf("DDR clock: %u MHz\n", current);
++		return CMD_RET_SUCCESS;
++	}
++
++	if (!strcmp(argv[1], "check"))
++		return ddrfreq_check(current);
++
++	requested = dectoul(argv[1], NULL);
++	if (argc > 2)
++		postdiv1 = dectoul(argv[2], NULL);
++	if (postdiv1 > 7) {
++		printf("ddrfreq: POSTDIV1 must be 1...7\n");
++		return CMD_RET_FAILURE;
++	}
++	if (requested < 200 || requested > 800) {
++		printf("ddrfreq: %u MHz is outside 200...800 MHz\n", requested);
++		return CMD_RET_FAILURE;
++	}
++
++	if (code_size == 0 || code_size > SRAM_CODE_MAX ||
++	    sizeof(param) > SRAM_SIZE - SRAM_CODE_MAX - SZ_1K) {
++		printf("ddrfreq: SRAM code %lu bytes, does not fit\n", code_size);
++		return CMD_RET_FAILURE;
++	}
++
++	memset(param, 0, sizeof(param));
++	mhz = ddrfreq_pll(requested, postdiv1, &param[0]);
++	if (mhz == current) {
++		printf("DDR clock already %u MHz\n", current);
++		return CMD_RET_SUCCESS;
++	}
++
++	if (ddrfreq_parameters(mhz, &param[0]) ||
++	    ddrfreq_parameters(current, &param[1])) {
++		printf("ddrfreq: no DDR3 timings for %u MHz\n", mhz);
++		return CMD_RET_FAILURE;
++	}
++
++	param[0].mhz = mhz;
++	param[0].up = mhz > current;
++	param[0].dram_dll_on_before = current > DRAM_DLL_DISABLE_MHZ;
++
++	/* The fallback: the current DPLL dividers, timings and DLL state */
++	param[1].mhz = current;
++	param[1].up = !param[0].up;
++	param[1].dram_dll_on_before = param[0].dram_dll_on_after;
++	param[1].dpll_con0 = (0xfff << 16) | (0x7 << 28) |
++			     (readl(CRU_DPLL_CON0) & 0x7fff);
++	param[1].dpll_con1 = (0x3f << 16) | (0x7 << 22) | (0x10001 << 12) |
++			     (readl(CRU_DPLL_CON1) & 0x1ff);
++
++	param[0].verbose = verbose;
++	param[1].verbose = verbose;
++	param[0].loops_per_us = ddrfreq_cpu_mhz();
++	param[1].loops_per_us = param[0].loops_per_us;
++
++	printf("DDR clock %u -> %u MHz (DPLL FBDIV %u POSTDIV1 %u, CL %u, CWL %u, tRFC %u, tRAS %u, tRC %u, code %lu bytes)\n",
++	       current, mhz, param[0].dpll_con0 & 0xfff,
++	       (param[0].dpll_con0 >> 12) & 0x7,
++	       param[0].timing[T(PCTL_TCL)], param[0].timing[T(PCTL_TCWL)],
++	       param[0].timing[T(PCTL_BASE + 0xd8)],
++	       param[0].timing[T(PCTL_BASE + 0xf0)],
++	       param[0].timing[T(PCTL_BASE + 0xf4)], code_size);
++
++	/* MMU and data cache off: nothing gets written back during the change */
++	if (dcache_was_on)
++		dcache_disable();
++
++	memcpy((void *)SRAM_BASE, (void *)code_start, code_size);
++	memcpy(sram_param, param, sizeof(param));
++	invalidate_icache_all();
++
++	ddrfreq_call_on_sram_stack((SRAM_BASE + entry - code_start) |
++				   ((ulong)ddrfreq_sram & 1UL), sram_param);
++
++	invalidate_icache_all();
++	if (dcache_was_on)
++		dcache_enable();
++	if (verbose)
++		printf("\n");
++
++	if (sram_param[0].result) {
++		printf("ddrfreq: %u MHz failed (data training or DRAM check), back at %u MHz\n",
++		       mhz, ddrfreq_current());
++		return CMD_RET_FAILURE;
++	}
++
++	printf("DDR clock now %u MHz\n", ddrfreq_current());
++
++	return CMD_RET_SUCCESS;
++}
++
++U_BOOT_CMD(ddrfreq, 4, 0, do_ddrfreq,
++	   "show or change the DDR3 clock (RK3126/RK3128)",
++	   "[-v] [MHz [POSTDIV1] | check]\n"
++	   "    without argument: show the current DDR clock\n"
++	   "    MHz: new clock, 200...800 (rounded to what the DPLL gives)\n"
++	   "    POSTDIV1: DPLL post divider 1...7 (default: vendor choice)\n"
++	   "    -v: progress letters a...m from the SRAM code (T: training\n"
++	   "        failed, M: DRAM check failed, R: back to the old clock)\n"
++	   "    check: compare the timings computed for the current clock\n"
++	   "           with the controller registers"
++);

@@ -12,6 +12,10 @@ rootfdtfile=rk3126-denver-frame-sdroot.dtb
 # eMMC: mmcblk0)
 rootdev=/dev/mmcblk1p2
 
+# DDR3 clock in MHz, set by U-Boot before the kernel starts (default 456,
+# empty: 300 MHz as left by the Rockchip DDR init)
+#ddr_mhz=456
+
 # Additional kernel arguments, e.g. "usbspeed=full" if USB transfers to the
 # PC fail (the USB-C port only has data lines in one plug orientation).
 # fbcon=rotate:1 turns the text console upright on the portrait panel.

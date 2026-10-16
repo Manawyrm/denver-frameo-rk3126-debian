@@ -165,6 +165,47 @@ Debian with `rootdev`), first from the SD card (`sdboot`), then from the
 eMMC (`emmcboot`). A bootable SD card always wins, so it is also the way
 back from a broken eMMC installation.
 
+### U-Boot patches
+
+| Patch | |
+|---|---|
+| 0001 | clock driver: SD card and eMMC clocks of the RK3128 |
+| 0002 | dw_mmc: honour `bus-width = <1>` (SD card D1 is UART2_RX) |
+| 0003 | `dramtest` command |
+| 0004 | enable the I-cache: with `CONFIG_SKIP_LOWLEVEL_INIT` start.S never did, U-Boot ran 6-8 times slower in code with many instructions per byte |
+| 0005 | `ddrfreq` command |
+
+### DDR clock
+
+The Rockchip DDR init leaves the DDR3 at 300 MHz (DDR3-600). `ddrfreq MHz`
+changes the clock from U-Boot; it is a port of the frequency change of the
+Rockchip 3.10 kernel (`ddr_rk3126b.c`). The change runs from the 8 KiB
+on-chip SRAM with the MMU off: DRAM into self-refresh, new DPLL dividers,
+PCTL/NoC timings, PHY settings and DRAM mode registers, data training,
+back. When the training or a quick DRAM check at the new clock fails, the
+SRAM code switches back to the old clock. `ddrfreq check` compares the
+timings computed for the current clock with the controller registers
+(no difference to the Rockchip DDR init at 300 MHz). `ddrfreq -v` prints
+progress letters from the SRAM code.
+
+`dramtest` writes the whole range (by default all DRAM below U-Boot) before
+it reads it back, with the data cache cleaned and invalidated in between,
+so the DRAM is tested and not the cache. `dramtest -u` runs with the data
+cache off.
+
+Results on the frame (one `dramtest` pass over 974 MiB takes ~2 minutes):
+
+| DDR clock | CL/CWL | Result | memcpy |
+|---|---|---|---|
+| 300 MHz (DDR init) | 6/5 | ok | 457 MB/s |
+| 396 MHz (stock firmware) | 6/5 | ok | 573 MB/s |
+| 456 MHz | 8/6 | ok: 5 `dramtest` passes and an uncached one; Linux for 40 min with `cpu-verify` (3 threads), memtester (400 MiB, 11 of its tests) and the kiosk running | 639 MB/s |
+| 528 MHz | 8/6 | U-Boot crashes after the change | |
+
+The boot environment sets `ddr_mhz=456` right before it starts Debian; an
+`ddr_mhz=` line in `uEnv.txt` overrides it (empty: stay at 300 MHz). The
+rescue initramfs always runs at 300 MHz.
+
 Raise `UBOOT_PKG_REVISION` in `uboot/uboot.env` whenever patches, device
 tree, config or environment change.
 
