@@ -1,0 +1,47 @@
+From: picture-frame build
+Subject: [PATCH] clk: rockchip: rk3128: reset like the Rockchip kernel
+
+The Rockchip kernel restarts the RK312x with APLL, CPLL and GPLL in slow
+mode and the second global reset. With the first global reset that
+mainline uses, the Rockchip DDR init failed its memory test in about
+every second warm reboot after U-Boot had raised the DDR clock to
+456 MHz; with the vendor sequence 7 of 7 reboots went through.
+---
+diff --git a/drivers/clk/rockchip/clk-rk3128.c b/drivers/clk/rockchip/clk-rk3128.c
+--- a/drivers/clk/rockchip/clk-rk3128.c
++++ b/drivers/clk/rockchip/clk-rk3128.c
+@@ -570,6 +570,23 @@
+ 	"sclk_timer5",
+ };
+ 
++static void __iomem *rk3128_cru_base;
++
++/*
++ * Reset like the Rockchip kernel does: APLL, CPLL and GPLL into slow mode,
++ * then the second global reset. After the first global reset the Rockchip
++ * DDR init now and then fails its memory test ("W FF != R") when U-Boot
++ * had raised the DDR clock. Called before the generic handler writes the
++ * first global reset, which is never reached.
++ */
++static void rk3128_restart(void)
++{
++	writel(0x11010000, rk3128_cru_base + RK2928_MODE_CON);
++	dsb();
++	writel(0xeca8, rk3128_cru_base + RK2928_GLB_SRST_SND);
++	dsb();
++}
++
+ static struct rockchip_clk_provider *__init rk3128_common_clk_init(struct device_node *np,
+ 								   unsigned long soc_nr_clks)
+ {
+@@ -606,7 +623,9 @@
+ 	rockchip_register_softrst(np, 9, reg_base + RK2928_SOFTRST_CON(0),
+ 				  ROCKCHIP_SOFTRST_HIWORD_MASK);
+ 
+-	rockchip_register_restart_notifier(ctx, RK2928_GLB_SRST_FST, NULL);
++	rk3128_cru_base = reg_base;
++	rockchip_register_restart_notifier(ctx, RK2928_GLB_SRST_FST,
++					   rk3128_restart);
+ 
+ 	return ctx;
+ }

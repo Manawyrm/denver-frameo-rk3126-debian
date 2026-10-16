@@ -102,6 +102,8 @@ or device trees change.
 | 0001 dw-mipi-dsi: clock lane in LP in command mode | The JD9365 panel only starts its DSI receiver when it sees LP-11 on the clock lane after its reset; without it the display stays black. |
 | 0002 mmc: quirks for the RK915 SDIO WiFi | Short CISTPL_FUNCE, continuous SDIO clock, CMD52 waits for DAT, matched by `compatible = "rockchip,rk915"`. From the RK915 driver port. |
 | 0003 dw_mmc: survive an SDIO card that stops responding | Masks stray FIFO interrupts, software data timeout for SDIO writes (from PR #1 of the RK915 driver port, write timeout limited to SDIO). |
+| 0004 ASoC: RK3128/RK3126 internal codec | Playback driver for the internal codec (`inno_rk3128`), work in progress: the output is heavily distorted. |
+| 0005 clk: rk3128: reset like the Rockchip kernel | Restart with APLL, CPLL and GPLL in slow mode and the second global reset. With mainline's first global reset the Rockchip DDR init failed its memory test ("W FF != R") in about every second warm reboot after U-Boot had raised the DDR clock to 456 MHz; with this sequence 12 of 12 reboots went through. |
 
 ## RK915 WiFi driver
 
