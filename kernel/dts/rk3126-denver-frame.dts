@@ -31,9 +31,22 @@
 #include <dt-bindings/input/input.h>
 #include "rk3128.dtsi"
 
-/* The SoC is an RK3126B: a few clock gates differ from the RK3128 */
+/*
+ * The SoC is an RK3126B: a few clock gates differ from the RK3128.
+ *
+ * CPLL at 800 MHz instead of 500 MHz, for a real 400 MHz GPU clock
+ * (CPLL/2, see the GPU). The clocks below CPLL that no driver sets get
+ * fixed rates: pclk_pmu 80 MHz (800/10, was 83 MHz), hclk_vio moves to
+ * GPLL at 118.8 MHz (594/5, was 125 MHz). eMMC, SDIO, UART and I2S drivers
+ * set their own rates.
+ */
 &cru {
 	compatible = "rockchip,rk3126-cru";
+	assigned-clocks = <&cru PLL_GPLL>, <&cru PLL_CPLL>,
+			  <&cru PCLK_PMU_PRE>, <&cru HCLK_VIO>;
+	assigned-clock-parents = <0>, <0>, <0>, <&cru PLL_GPLL>;
+	assigned-clock-rates = <594000000>, <800000000>,
+			       <80000000>, <118800000>;
 };
 
 &cpu0 {
@@ -337,6 +350,12 @@
  * Mali-400 MP2 (lima). vdd_logic is fixed at 1.15 V, so the GPU clock is
  * scaled without voltage changes: drop the 480 MHz point (1.25 V). The
  * stock firmware ran the GPU at 396 MHz.
+ *
+ * The GPU clock is a divider after a PLL mux: 400 and 200 MHz come from
+ * CPLL (800 MHz), 300 MHz would be GPLL/2 (297 MHz). Switching between
+ * the two PLLs at run time (devfreq) made the system unstable (dying
+ * processes, a white kiosk), so the 300 MHz point is dropped: only the
+ * divider changes. 500 MHz fails at 1.15 V (2026-10-16).
  */
 &gpu {
 	/* Fixed 1.15 V, within the range of all remaining GPU OPPs */
@@ -345,6 +364,7 @@
 };
 
 &gpu_opp_table {
+	/delete-node/ opp-300000000;
 	/delete-node/ opp-480000000;
 };
 
