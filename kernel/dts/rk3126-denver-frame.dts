@@ -462,6 +462,16 @@
 	status = "okay";
 };
 
+/*
+ * Pull on UART2_RX (GPIO1_C3; fixed pull-up on this pin, the RK3126 can
+ * only switch it on or off). The SoC DT leaves it off: without a USB-UART
+ * adapter the pin floats, picks up noise and stops the U-Boot autoboot.
+ */
+&uart2_xfer {
+	rockchip,pins = <1 RK_PC2 2 &pcfg_pull_default>,
+			<1 RK_PC3 2 &pcfg_pull_default>;
+};
+
 &uart2 {
 	status = "okay";
 };
