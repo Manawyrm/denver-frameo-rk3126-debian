@@ -1,0 +1,25 @@
+From: picture-frame build
+Subject: [PATCH] rockchip: enable the I-cache in enable_caches()
+
+With CONFIG_SKIP_LOWLEVEL_INIT (U-Boot started by the Rockchip
+miniloader on the RK3126), start.S never enables the I-cache, so U-Boot
+ran with it off: code with many instructions per byte (e.g. a DRAM test
+loop) was 6-8 times slower.
+---
+diff --git a/arch/arm/mach-rockchip/board.c b/arch/arm/mach-rockchip/board.c
+--- a/arch/arm/mach-rockchip/board.c
++++ b/arch/arm/mach-rockchip/board.c
+@@ -210,7 +210,12 @@
+ #if !defined(CONFIG_SYS_DCACHE_OFF) && !defined(CONFIG_ARM64)
+ void enable_caches(void)
+ {
+-	/* Enable D-cache. I-cache is already enabled in start.S */
++	/*
++	 * start.S only enables the I-cache in cpu_init_cp15, which
++	 * CONFIG_SKIP_LOWLEVEL_INIT skips (U-Boot started by the Rockchip
++	 * miniloader): enable it here, it is a no-op when already on
++	 */
++	icache_enable();
+ 	dcache_enable();
+ }
+ #endif
