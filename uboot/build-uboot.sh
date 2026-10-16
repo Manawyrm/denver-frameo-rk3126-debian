@@ -4,14 +4,14 @@
 # picture frame (RK3126B) and package them as a Debian package:
 #
 #   1. Clone the pinned U-Boot tag (uboot.env), check the commit
-#   2. Download DDR init, miniloader and loaderimage from the pinned rkbin
-#      commit, check their SHA-256
+#   2. Download loaderimage from the pinned rkbin commit, check the SHA-256
+#      of it and of the stock DDR init + miniloader (blobs/)
 #   3. Apply patches/*.patch, add the device tree and boot environment
 #   4. evb-rk3128_defconfig + config/rk3126-sdboot.config, check that every
 #      option of the fragment made it into the final .config
-#   5. Build u-boot.bin, pack idbloader.img (DDR init + miniloader, for
-#      sector 64) and uboot.img (U-Boot for the miniloader, for sector
-#      0x4000)
+#   5. Build u-boot.bin, pack uboot.img (U-Boot for the miniloader, for
+#      sector 0x4000), copy idbloader.img (stock DDR init + miniloader, for
+#      sector 64)
 #
 # Usage: uboot/build-uboot.sh
 #
@@ -46,10 +46,13 @@ fetch_sources()
 {
 	log "U-Boot $UBOOT_TAG and rkbin ${RKBIN_COMMIT:0:12}"
 	fetch_git "$UBOOT_GIT" "$UBOOT_TAG" "$UBOOT_COMMIT" "$GIT_CACHE"
-	fetch_file "$RKBIN_URL/$RKBIN_DDR" "$RKBIN/$RKBIN_DDR" "$RKBIN_DDR_SHA256"
-	fetch_file "$RKBIN_URL/$RKBIN_MINILOADER" "$RKBIN/$RKBIN_MINILOADER" "$RKBIN_MINILOADER_SHA256"
 	fetch_file "$RKBIN_URL/$RKBIN_LOADERIMAGE" "$RKBIN/$RKBIN_LOADERIMAGE" "$RKBIN_LOADERIMAGE_SHA256"
 	chmod +x "$RKBIN/$RKBIN_LOADERIMAGE"
+
+	if ! echo "$IDBLOADER_SHA256  $UBOOT_DIR/$IDBLOADER_BLOB" | sha256sum -c --quiet
+	then
+		die "SHA-256 mismatch: $UBOOT_DIR/$IDBLOADER_BLOB"
+	fi
 }
 
 prepare_source()
@@ -82,9 +85,8 @@ build()
 	log "Packing the boot loader images"
 	mkdir -p "$OUTPUT_DIR"
 
-	# DDR init + miniloader, written to sector 64
-	"$OBJ/tools/mkimage" -n rk3128 -T rksd \
-		-d "$RKBIN/$RKBIN_DDR:$RKBIN/$RKBIN_MINILOADER" "$OUTPUT_DIR/idbloader.img"
+	# Stock DDR init + miniloader, written to sector 64 (see uboot.env)
+	cp "$UBOOT_DIR/$IDBLOADER_BLOB" "$OUTPUT_DIR/idbloader.img"
 
 	# U-Boot in the format the miniloader expects (2 copies of 1 MiB),
 	# written to sector 0x4000

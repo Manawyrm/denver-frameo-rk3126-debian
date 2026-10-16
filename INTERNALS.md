@@ -132,8 +132,9 @@ uboot/build-uboot.sh
 ```
 
 Clones the pinned U-Boot tag (and checks that it is the pinned commit),
-downloads the Rockchip DDR init, miniloader and `loaderimage` tool from the
-pinned rkbin commit (each checked against its SHA-256), applies
+downloads the `loaderimage` tool from the pinned rkbin commit, checks it and
+the stock DDR init + miniloader (`uboot/blobs/`) against their SHA-256,
+applies
 `uboot/patches/`, configures `evb-rk3128_defconfig` plus
 `uboot/config/rk3126-sdboot.config` (checked like the kernel fragment) and
 builds:
@@ -146,7 +147,17 @@ output/u-boot-denver-frameo_2026.10-1_armhf.deb
 ```
 
 There is no mainline DDR init (TPL) for the RK3126, so the boot chain is
-BootROM -> Rockchip DDR init + miniloader -> U-Boot. `loaderimage` only
+BootROM -> Rockchip DDR init + miniloader -> U-Boot.
+
+`idbloader.img` is the one of the stock firmware (DDR init 2.08, miniloader
+2.59), copied unchanged from sector 64 of the frame's eMMC. The miniloader
+of rkbin (2.63) does not work here: it only starts U-Boot through a trust
+OS (OP-TEE, `trust.img`). Without one it searches for it, gives up and
+switches to Rockchip USB download mode, which never shows up on the host
+with this board. The stock miniloader runs into the same failed trust
+search and then starts U-Boot directly.
+
+`loaderimage` only
 exists as an x86-64 binary; on other build hosts it runs through
 qemu-user. The boot environment (`uboot/config/rk3126-sdboot.env`) loads
 the kernel from the FAT boot partition (`uEnv.txt`, rescue initramfs or
@@ -209,7 +220,7 @@ Both images contain the same root file system and boot loader:
 
 | Where | What |
 |---|---|
-| sector 64 | `idbloader.img` (DDR init + miniloader) |
+| sector 64 | `idbloader.img` (stock DDR init + miniloader) |
 | sector 0x4000 (8 MiB) | `uboot.img` |
 | partition 1, 16 MiB, 256 MiB | FAT32 `BOOT`: kernel, device trees, `uEnv.txt` |
 | partition 2, 1.5 GiB | ext4 `rootfs`, grows on the first boot |
@@ -241,6 +252,18 @@ xzcat emmc.img.xz | dd of=/dev/mmcblk0 bs=4M
 ```
 
 and reboot without the SD card.
+
+The boot ROM tries the eMMC before the SD card. If the loader on the eMMC is
+broken (it starts, but does not get to U-Boot), the SD card is never used:
+short the eMMC clock to ground while switching on and release it after
+about a second. The boot ROM then falls back to the SD card, and its
+miniloader brings up the eMMC again. From the SD card system, write a
+working loader back:
+
+```
+blockdev --setrw /dev/mmcblk0
+dd if=/usr/lib/u-boot/denver-frameo/idbloader.img of=/dev/mmcblk0 seek=64 conv=fsync
+```
 
 ## Build host
 
