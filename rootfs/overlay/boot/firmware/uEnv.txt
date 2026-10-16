@@ -13,5 +13,6 @@ rootfdtfile=rk3126-denver-frame-sdroot.dtb
 rootdev=/dev/mmcblk1p2
 
 # Additional kernel arguments, e.g. "usbspeed=full" if USB transfers to the
-# PC fail (the USB-C port only has data lines in one plug orientation)
-bootargs_extra=
+# PC fail (the USB-C port only has data lines in one plug orientation).
+# fbcon=rotate:1 turns the text console upright on the portrait panel.
+bootargs_extra=fbcon=rotate:1
