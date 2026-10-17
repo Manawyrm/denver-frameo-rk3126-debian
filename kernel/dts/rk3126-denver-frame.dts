@@ -262,9 +262,16 @@
  * No pinctrl: RK3126 and RK3128 route EMMC_CMD to different pins, the
  * Rockchip loader has already set them up.
  */
+/*
+ * DDR52 doubles the eMMC throughput (sequential reads 37 -> 60 MB/s,
+ * writes about 50 MB/s). It needs the bus clocks of kernel patch 0006: the
+ * PL330 that moves the data runs on aclk_peri, and at the boot loader's
+ * 74.25 MHz it aborted dozens of transfers per GB read.
+ */
 &emmc {
 	bus-width = <8>;
 	cap-mmc-highspeed;
+	mmc-ddr-3_3v;
 	non-removable;
 	no-sd;
 	no-sdio;
