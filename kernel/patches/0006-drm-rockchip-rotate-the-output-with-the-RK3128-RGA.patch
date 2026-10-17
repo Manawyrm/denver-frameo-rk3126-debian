@@ -1,0 +1,1564 @@
+From: picture-frame build
+Subject: [PATCH] drm/rockchip: rotate the output with the RK3128 RGA
+
+Panels that are mounted rotated need every frame rotated, and the VOP of
+the RK3126/RK3128 cannot rotate. With "rockchip,output-rotation" (90 or
+270 degrees clockwise) and "rockchip,rga" in the VOP node and
+rockchipdrm.rga_rotation=1, the connector reports rotated modes, the
+primary plane takes framebuffers in that orientation (and is the only
+plane), and the RGA (version 1, new driver rockchip_rga1.c) rotates the
+damaged part of every new framebuffer into one of two buffers in the
+orientation of the panel, in the commit tail. Compositors can then scan
+out client buffers directly instead of rotating them on the GPU.
+
+The register values for the RGA follow the Rockchip vendor driver
+(drivers/video/rockchip/rga). /sys/kernel/debug/rockchip-rga1 shows the
+job statistics.
+
+Measured on the Denver frame (1280x800, Chromium in cage): a full frame
+takes the RGA 8-10 ms on an idle system and about 20 ms while Chromium
+renders, which limits a full-screen crossfade to 28 fps (34 fps with
+the rotation on the GPU). Off by default for that reason.
+---
+--- a/drivers/gpu/drm/rockchip/Makefile
++++ b/drivers/gpu/drm/rockchip/Makefile
+@@ -7,7 +7,8 @@
+ 		rockchip_drm_gem.o
+ 
+ rockchipdrm-$(CONFIG_ROCKCHIP_VOP2) += rockchip_drm_vop2.o rockchip_vop2_reg.o
+-rockchipdrm-$(CONFIG_ROCKCHIP_VOP) += rockchip_drm_vop.o rockchip_vop_reg.o
++rockchipdrm-$(CONFIG_ROCKCHIP_VOP) += rockchip_drm_vop.o rockchip_vop_reg.o \
++				      rockchip_rga1.o
+ rockchipdrm-$(CONFIG_ROCKCHIP_ANALOGIX_DP) += analogix_dp-rockchip.o
+ rockchipdrm-$(CONFIG_ROCKCHIP_CDN_DP) += cdn-dp-core.o cdn-dp-reg.o
+ rockchipdrm-$(CONFIG_ROCKCHIP_DW_HDMI) += dw_hdmi-rockchip.o
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_drv.c
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_drv.c
+@@ -182,6 +182,8 @@
+ 	if (ret)
+ 		goto err_free;
+ 
++	rockchip_drm_vop_rotation_init(drm_dev);
++
+ 	ret = rockchip_drm_init_iommu(drm_dev);
+ 	if (ret)
+ 		goto err_unbind_all;
+@@ -546,10 +548,20 @@
+ 	ADD_ROCKCHIP_SUB_DRIVER(rk3066_hdmi_driver,
+ 				CONFIG_ROCKCHIP_RK3066_HDMI);
+ 
++	/*
++	 * Not a sub driver: every device of a sub driver becomes a component
++	 * of the display subsystem, the RGA is only used by the VOP.
++	 */
++	if (IS_ENABLED(CONFIG_ROCKCHIP_VOP)) {
++		ret = platform_driver_register(&rockchip_rga1_driver);
++		if (ret)
++			return ret;
++	}
++
+ 	ret = platform_register_drivers(rockchip_sub_drivers,
+ 					num_rockchip_sub_drivers);
+ 	if (ret)
+-		return ret;
++		goto err_unreg_rga;
+ 
+ 	ret = platform_driver_register(&rockchip_drm_platform_driver);
+ 	if (ret)
+@@ -560,6 +572,9 @@
+ err_unreg_drivers:
+ 	platform_unregister_drivers(rockchip_sub_drivers,
+ 				    num_rockchip_sub_drivers);
++err_unreg_rga:
++	if (IS_ENABLED(CONFIG_ROCKCHIP_VOP))
++		platform_driver_unregister(&rockchip_rga1_driver);
+ 	return ret;
+ }
+ 
+@@ -569,6 +584,9 @@
+ 
+ 	platform_unregister_drivers(rockchip_sub_drivers,
+ 				    num_rockchip_sub_drivers);
++
++	if (IS_ENABLED(CONFIG_ROCKCHIP_VOP))
++		platform_driver_unregister(&rockchip_rga1_driver);
+ }
+ 
+ module_init(rockchip_drm_init);
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_drv.h
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_drv.h
+@@ -54,6 +54,19 @@
+ 	u32 bus_flags;
+ 	int color_space;
+ };
++#if IS_ENABLED(CONFIG_ROCKCHIP_VOP)
++void rockchip_drm_vop_rotation_init(struct drm_device *drm);
++void rockchip_drm_vop_rotate_planes(struct drm_atomic_commit *state);
++#else
++static inline void rockchip_drm_vop_rotation_init(struct drm_device *drm)
++{
++}
++
++static inline void rockchip_drm_vop_rotate_planes(struct drm_atomic_commit *state)
++{
++}
++#endif
++
+ #define to_rockchip_crtc_state(s) \
+ 		container_of(s, struct rockchip_crtc_state, base)
+ 
+@@ -96,6 +109,7 @@
+ extern struct platform_driver rockchip_dp_driver;
+ extern struct platform_driver rockchip_lvds_driver;
+ extern struct platform_driver vop_platform_driver;
++extern struct platform_driver rockchip_rga1_driver;
+ extern struct platform_driver rk3066_hdmi_driver;
+ extern struct platform_driver vop2_platform_driver;
+ 
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_fb.c
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_fb.c
+@@ -24,8 +24,35 @@
+ 	.dirty	       = drm_atomic_helper_dirtyfb,
+ };
+ 
++/*
++ * drm_atomic_helper_commit_tail_rpm(), but the RGA first rotates the new
++ * framebuffers of rotated outputs. The fences of the framebuffers have
++ * signalled at this point, and the previous commit has flipped.
++ */
++static void rockchip_atomic_commit_tail(struct drm_atomic_commit *state)
++{
++	struct drm_device *dev = state->dev;
++
++	rockchip_drm_vop_rotate_planes(state);
++
++	drm_atomic_helper_commit_modeset_disables(dev, state);
++
++	drm_atomic_helper_commit_modeset_enables(dev, state);
++
++	drm_atomic_helper_commit_planes(dev, state,
++					DRM_PLANE_COMMIT_ACTIVE_ONLY);
++
++	drm_atomic_helper_fake_vblank(state);
++
++	drm_atomic_helper_commit_hw_done(state);
++
++	drm_atomic_helper_wait_for_vblanks(dev, state);
++
++	drm_atomic_helper_cleanup_planes(dev, state);
++}
++
+ static const struct drm_mode_config_helper_funcs rockchip_mode_config_helpers = {
+-	.atomic_commit_tail = drm_atomic_helper_commit_tail_rpm,
++	.atomic_commit_tail = rockchip_atomic_commit_tail,
+ };
+ 
+ static struct drm_framebuffer *
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
+@@ -21,12 +21,14 @@
+ #include <drm/drm_atomic.h>
+ #include <drm/drm_atomic_uapi.h>
+ #include <drm/drm_blend.h>
++#include <drm/drm_damage_helper.h>
+ #include <drm/drm_crtc.h>
+ #include <drm/drm_flip_work.h>
+ #include <drm/drm_fourcc.h>
+ #include <drm/drm_framebuffer.h>
+ #include <drm/drm_gem_atomic_helper.h>
+ #include <drm/drm_gem_framebuffer_helper.h>
++#include <drm/drm_managed.h>
+ #include <drm/drm_print.h>
+ #include <drm/drm_probe_helper.h>
+ #include <drm/drm_self_refresh_helper.h>
+@@ -41,6 +43,7 @@
+ #include "rockchip_drm_fb.h"
+ #include "rockchip_drm_vop.h"
+ #include "rockchip_rgb.h"
++#include "rockchip_rga1.h"
+ 
+ #define VOP_WIN_SET(vop, win, name, v) \
+ 		vop_reg_set(vop, &win->phy->name, win->base, ~0, v, #name)
+@@ -105,6 +108,11 @@
+ 	} while (0)
+ 
+ #define to_vop(x) container_of(x, struct vop, crtc)
++
++static bool rga_rotation;
++module_param(rga_rotation, bool, 0444);
++MODULE_PARM_DESC(rga_rotation,
++		 "Rotate outputs with the RGA as rockchip,output-rotation says (default: false)");
+ #define to_vop_win(x) container_of(x, struct vop_win, base)
+ 
+ #define AFBC_FMT_RGB565		0x0
+@@ -185,6 +193,24 @@
+ 	/* optional internal rgb encoder */
+ 	struct rockchip_rgb *rgb;
+ 
++	/*
++	 * Output rotation: the connector modes are rotated, the primary plane
++	 * shows a framebuffer in the rotated orientation, and the RGA rotates
++	 * every new framebuffer into one of two buffers in the orientation of
++	 * the panel. @rotation is clockwise, 0 without rotation.
++	 */
++	struct rockchip_rga1 *rga;
++	unsigned int rotation;
++	struct rockchip_gem_object *rot_buf[2];
++	/* rot_buf[rot_front] is the one the VOP shows, if rot_valid */
++	unsigned int rot_front;
++	bool rot_valid;
++	/*
++	 * Region of the plane (rotated orientation) that is out of date in
++	 * each buffer: the RGA only rotates what changed
++	 */
++	struct drm_rect rot_missing[2];
++
+ 	struct vop_win win[];
+ };
+ 
+@@ -808,6 +834,65 @@
+ 	return vop_convert_afbc_format(format) >= 0;
+ }
+ 
++/* Swaps the horizontal and vertical timings of a mode */
++static void vop_rotate_mode(struct drm_display_mode *mode)
++{
++	u32 flags = mode->flags;
++
++	swap(mode->hdisplay, mode->vdisplay);
++	swap(mode->hsync_start, mode->vsync_start);
++	swap(mode->hsync_end, mode->vsync_end);
++	swap(mode->htotal, mode->vtotal);
++	swap(mode->width_mm, mode->height_mm);
++	mode->hskew = 0;
++
++	mode->flags &= ~(DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_NHSYNC |
++			 DRM_MODE_FLAG_PVSYNC | DRM_MODE_FLAG_NVSYNC);
++	if (flags & DRM_MODE_FLAG_PHSYNC)
++		mode->flags |= DRM_MODE_FLAG_PVSYNC;
++	if (flags & DRM_MODE_FLAG_NHSYNC)
++		mode->flags |= DRM_MODE_FLAG_NVSYNC;
++	if (flags & DRM_MODE_FLAG_PVSYNC)
++		mode->flags |= DRM_MODE_FLAG_PHSYNC;
++	if (flags & DRM_MODE_FLAG_NVSYNC)
++		mode->flags |= DRM_MODE_FLAG_NHSYNC;
++
++	drm_mode_set_crtcinfo(mode, CRTC_INTERLACE_HALVE_V);
++}
++
++/*
++ * With output rotation, the primary plane has to cover the whole CRTC
++ * unscaled, with a linear 32 bpp framebuffer the RGA can rotate.
++ */
++static int vop_plane_check_rotation(struct drm_plane_state *plane_state,
++				    struct drm_crtc_state *crtc_state)
++{
++	struct drm_framebuffer *fb = plane_state->fb;
++	struct drm_rect *src = &plane_state->src;
++	struct drm_rect *dst = &plane_state->dst;
++
++	if (plane_state->plane->type != DRM_PLANE_TYPE_PRIMARY)
++		return -EINVAL;
++
++	if (fb->format->cpp[0] != 4 || fb->format->is_yuv ||
++	    fb->modifier != DRM_FORMAT_MOD_LINEAR) {
++		DRM_DEBUG_KMS("rotated output: unsupported framebuffer\n");
++		return -EINVAL;
++	}
++
++	if (dst->x1 != 0 || dst->y1 != 0 ||
++	    drm_rect_width(dst) != crtc_state->mode.hdisplay ||
++	    drm_rect_height(dst) != crtc_state->mode.vdisplay ||
++	    drm_rect_width(src) >> 16 != drm_rect_width(dst) ||
++	    drm_rect_height(src) >> 16 != drm_rect_height(dst) ||
++	    (src->x1 | src->y1) & 0xffff) {
++		DRM_DEBUG_KMS("rotated output: plane must cover the CRTC unscaled\n");
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
+ static int vop_plane_atomic_check(struct drm_plane *plane,
+ 			   struct drm_atomic_commit *state)
+ {
+@@ -844,6 +929,14 @@
+ 	if (ret < 0)
+ 		return ret;
+ 
++	if (to_vop(crtc)->rotation) {
++		ret = vop_plane_check_rotation(new_plane_state, crtc_state);
++		if (ret)
++			return ret;
++
++		drm_atomic_helper_check_plane_damage(state, new_plane_state);
++	}
++
+ 	/*
+ 	 * Src.x1 can be odd when do clip, but yuv plane start point
+ 	 * need align with 2 pixel.
+@@ -925,6 +1018,7 @@
+ 	struct drm_gem_object *obj, *uv_obj;
+ 	struct rockchip_gem_object *rk_obj, *rk_uv_obj;
+ 	unsigned long offset;
++	unsigned int pitch;
+ 	dma_addr_t dma_addr;
+ 	uint32_t val;
+ 	bool rb_swap, uv_swap;
+@@ -950,25 +1044,49 @@
+ 	obj = fb->obj[0];
+ 	rk_obj = to_rockchip_obj(obj);
+ 
+-	actual_w = drm_rect_width(src) >> 16;
+-	actual_h = drm_rect_height(src) >> 16;
+-	act_info = (actual_h - 1) << 16 | ((actual_w - 1) & 0xffff);
+-
+-	dsp_info = (drm_rect_height(dest) - 1) << 16;
+-	dsp_info |= (drm_rect_width(dest) - 1) & 0xffff;
+-
+-	dsp_stx = dest->x1 + crtc->mode.htotal - crtc->mode.hsync_start;
+-	dsp_sty = dest->y1 + crtc->mode.vtotal - crtc->mode.vsync_start;
+-	dsp_st = dsp_sty << 16 | (dsp_stx & 0xffff);
+-
+-	if (fb->format->char_per_block[0])
+-		offset = drm_format_info_min_pitch(fb->format, 0,
+-						   src->x1 >> 16);
+-	else
+-		offset = (src->x1 >> 16) * fb->format->cpp[0];
++	if (vop->rotation) {
++		/*
++		 * Show the buffer the RGA has rotated the framebuffer into,
++		 * on the whole display
++		 */
++		struct drm_display_mode *native = &crtc->state->adjusted_mode;
++
++		if (!vop->rot_valid) {
++			vop_plane_atomic_disable(plane, state);
++			return;
++		}
++
++		actual_w = native->hdisplay;
++		actual_h = native->vdisplay;
++		act_info = (actual_h - 1) << 16 | ((actual_w - 1) & 0xffff);
++		dsp_info = act_info;
++		dsp_stx = native->htotal - native->hsync_start;
++		dsp_sty = native->vtotal - native->vsync_start;
++		dsp_st = dsp_sty << 16 | (dsp_stx & 0xffff);
++		pitch = actual_w * 4;
++		dma_addr = vop->rot_buf[vop->rot_front]->dma_addr;
++	} else {
++		actual_w = drm_rect_width(src) >> 16;
++		actual_h = drm_rect_height(src) >> 16;
++		act_info = (actual_h - 1) << 16 | ((actual_w - 1) & 0xffff);
++
++		dsp_info = (drm_rect_height(dest) - 1) << 16;
++		dsp_info |= (drm_rect_width(dest) - 1) & 0xffff;
++
++		dsp_stx = dest->x1 + crtc->mode.htotal - crtc->mode.hsync_start;
++		dsp_sty = dest->y1 + crtc->mode.vtotal - crtc->mode.vsync_start;
++		dsp_st = dsp_sty << 16 | (dsp_stx & 0xffff);
+ 
+-	offset += (src->y1 >> 16) * fb->pitches[0];
+-	dma_addr = rk_obj->dma_addr + offset + fb->offsets[0];
++		if (fb->format->char_per_block[0])
++			offset = drm_format_info_min_pitch(fb->format, 0,
++							   src->x1 >> 16);
++		else
++			offset = (src->x1 >> 16) * fb->format->cpp[0];
++
++		offset += (src->y1 >> 16) * fb->pitches[0];
++		pitch = fb->pitches[0];
++		dma_addr = rk_obj->dma_addr + offset + fb->offsets[0];
++	}
+ 
+ 	/*
+ 	 * For y-mirroring we need to move address
+@@ -993,7 +1111,7 @@
+ 
+ 	VOP_WIN_SET(vop, win, format, format);
+ 	VOP_WIN_SET(vop, win, fmt_10, is_fmt_10(fb->format->format));
+-	VOP_WIN_SET(vop, win, yrgb_vir, DIV_ROUND_UP(fb->pitches[0], 4));
++	VOP_WIN_SET(vop, win, yrgb_vir, DIV_ROUND_UP(pitch, 4));
+ 	VOP_WIN_SET(vop, win, yrgb_mst, dma_addr);
+ 	VOP_WIN_YUV2YUV_SET(vop, win_yuv2yuv, y2r_en, is_yuv);
+ 	VOP_WIN_SET(vop, win, y_mir_en,
+@@ -1028,7 +1146,10 @@
+ 		VOP_WIN_SET(vop, win, uv_swap, uv_swap);
+ 	}
+ 
+-	if (win->phy->scl)
++	if (win->phy->scl && vop->rotation)
++		scl_vop_cal_scl_fac(vop, win, actual_w, actual_h,
++				    actual_w, actual_h, fb->format);
++	else if (win->phy->scl)
+ 		scl_vop_cal_scl_fac(vop, win, actual_w, actual_h,
+ 				    drm_rect_width(dest), drm_rect_height(dest),
+ 				    fb->format);
+@@ -1214,6 +1335,10 @@
+ 	struct vop *vop = to_vop(crtc);
+ 	unsigned long rate;
+ 
++	/* The modes are rotated, the panel needs its own timings */
++	if (vop->rotation)
++		vop_rotate_mode(adjusted_mode);
++
+ 	/*
+ 	 * Clock craziness.
+ 	 *
+@@ -1876,6 +2001,10 @@
+ 		    win_data->type != DRM_PLANE_TYPE_CURSOR)
+ 			continue;
+ 
++		/* With output rotation, only the primary plane is rotated */
++		if (vop->rotation && win_data->type != DRM_PLANE_TYPE_PRIMARY)
++			continue;
++
+ 		ret = drm_universal_plane_init(vop->drm_dev, &vop_win->base,
+ 					       0, &vop_plane_funcs,
+ 					       win_data->phy->data_formats,
+@@ -1891,6 +2020,8 @@
+ 		plane = &vop_win->base;
+ 		drm_plane_helper_add(plane, &plane_helper_funcs);
+ 		vop_plane_add_properties(plane, win_data);
++		if (vop->rotation)
++			drm_plane_enable_fb_damage_clips(plane);
+ 		if (plane->type == DRM_PLANE_TYPE_PRIMARY)
+ 			primary = plane;
+ 		else if (plane->type == DRM_PLANE_TYPE_CURSOR)
+@@ -1917,7 +2048,7 @@
+ 		const struct vop_win_data *win_data = vop_win->data;
+ 		unsigned long possible_crtcs = drm_crtc_mask(crtc);
+ 
+-		if (win_data->type != DRM_PLANE_TYPE_OVERLAY)
++		if (win_data->type != DRM_PLANE_TYPE_OVERLAY || vop->rotation)
+ 			continue;
+ 
+ 		ret = drm_universal_plane_init(vop->drm_dev, &vop_win->base,
+@@ -2114,6 +2245,323 @@
+ /*
+  * Initialize the vop->win array elements.
+  */
++/*
++ * Output rotation with the RGA, for panels that are mounted rotated
++ * ("rockchip,output-rotation" in degrees clockwise, 90 or 270, and
++ * "rockchip,rga" in the VOP node). Userspace sees rotated modes and a
++ * primary plane in that orientation; the RGA rotates every new framebuffer
++ * into the orientation of the panel in the commit tail.
++ */
++static int vop_rotation_setup(struct vop *vop)
++{
++	struct rockchip_rga1 *rga;
++	u32 rotation;
++
++	if (of_property_read_u32(vop->dev->of_node, "rockchip,output-rotation",
++				 &rotation))
++		return 0;
++
++	if (rotation != 90 && rotation != 270) {
++		DRM_DEV_ERROR(vop->dev, "unsupported output rotation %u\n",
++			      rotation);
++		return 0;
++	}
++
++	if (!rga_rotation) {
++		DRM_DEV_INFO(vop->dev,
++			     "output rotation off (rockchipdrm.rga_rotation=1)\n");
++		return 0;
++	}
++
++	rga = rockchip_rga1_get(vop->dev);
++	if (IS_ERR(rga))
++		return PTR_ERR(rga);
++
++	if (!rga) {
++		DRM_DEV_ERROR(vop->dev, "output rotation needs rockchip,rga\n");
++		return 0;
++	}
++
++	vop->rga = rga;
++	vop->rotation = rotation;
++	DRM_DEV_INFO(vop->dev, "output rotated by %u degrees with the RGA\n",
++		     rotation);
++
++	return 0;
++}
++
++static void vop_rotation_free(struct vop *vop)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(vop->rot_buf); i++) {
++		if (vop->rot_buf[i])
++			drm_gem_object_put(&vop->rot_buf[i]->base);
++
++		vop->rot_buf[i] = NULL;
++	}
++
++	vop->rot_valid = false;
++}
++
++/* The buffers for the panel, allocated with the first rotation */
++static int vop_rotation_alloc(struct vop *vop, unsigned int size)
++{
++	struct rockchip_gem_object *rk_obj;
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(vop->rot_buf); i++) {
++		if (vop->rot_buf[i] && vop->rot_buf[i]->base.size >= size)
++			continue;
++
++		/* Only reached when the shown buffer is too small as well */
++		if (vop->rot_buf[i])
++			drm_gem_object_put(&vop->rot_buf[i]->base);
++
++		vop->rot_buf[i] = NULL;
++		vop->rot_valid = false;
++
++		rk_obj = rockchip_gem_create_object(vop->drm_dev, size, false);
++		if (IS_ERR(rk_obj))
++			return PTR_ERR(rk_obj);
++
++		vop->rot_buf[i] = rk_obj;
++	}
++
++	return 0;
++}
++
++/* Smallest rectangle around a and b, either may be empty */
++static void vop_rect_union(struct drm_rect *a, const struct drm_rect *b)
++{
++	if (!drm_rect_visible(b))
++		return;
++
++	if (!drm_rect_visible(a)) {
++		*a = *b;
++		return;
++	}
++
++	a->x1 = min(a->x1, b->x1);
++	a->y1 = min(a->y1, b->y1);
++	a->x2 = max(a->x2, b->x2);
++	a->y2 = max(a->y2, b->y2);
++}
++
++static void vop_rotation_image(struct rockchip_gem_object *rk_obj,
++			       struct rockchip_rga1_image *image)
++{
++	image->sgt = rk_obj->sgt;
++	image->phys = rk_obj->dma_addr;
++	image->size = rk_obj->base.size;
++}
++
++/*
++ * Rotate what changed in the framebuffer of the primary plane into the
++ * hidden buffer, together with what that buffer missed of the previous frame
++ */
++static void vop_rotate_plane(struct vop *vop, struct drm_plane_state *old_state,
++			     struct drm_plane_state *state,
++			     struct drm_crtc_state *crtc_state)
++{
++	struct drm_display_mode *native = &crtc_state->adjusted_mode;
++	struct drm_framebuffer *fb = state->fb;
++	struct rockchip_rga1_image src = { };
++	struct rockchip_rga1_image dst = { };
++	unsigned int width = drm_rect_width(&state->src) >> 16;
++	unsigned int height = drm_rect_height(&state->src) >> 16;
++	unsigned int src_x = state->src.x1 >> 16;
++	unsigned int src_y = state->src.y1 >> 16;
++	unsigned int back;
++	struct drm_rect plane_rect;
++	struct drm_rect damage;
++	struct drm_rect region;
++	int ret;
++
++	ret = vop_rotation_alloc(vop, native->hdisplay * native->vdisplay * 4);
++	if (ret) {
++		DRM_DEV_ERROR_RATELIMITED(vop->dev,
++					  "no buffers for the rotation: %d\n", ret);
++		return;
++	}
++
++	drm_rect_init(&plane_rect, 0, 0, width, height);
++
++	if (!vop->rot_valid || drm_atomic_crtc_needs_modeset(crtc_state)) {
++		vop->rot_missing[0] = plane_rect;
++		vop->rot_missing[1] = plane_rect;
++		damage = plane_rect;
++	} else if (drm_atomic_helper_damage_merged(old_state, state, &damage)) {
++		/* Framebuffer coordinates to plane coordinates, 8x8 aligned */
++		drm_rect_translate(&damage, -src_x, -src_y);
++		damage.x1 = round_down(damage.x1, 8);
++		damage.y1 = round_down(damage.y1, 8);
++		damage.x2 = round_up(damage.x2, 8);
++		damage.y2 = round_up(damage.y2, 8);
++		drm_rect_intersect(&damage, &plane_rect);
++	} else {
++		/* Nothing changed */
++		return;
++	}
++
++	back = vop->rot_valid ? !vop->rot_front : 0;
++	region = damage;
++	vop_rect_union(&region, &vop->rot_missing[back]);
++	drm_rect_intersect(&region, &plane_rect);
++	if (!drm_rect_visible(&region))
++		return;
++
++	vop_rotation_image(to_rockchip_obj(fb->obj[0]), &src);
++	src.offset = fb->offsets[0] + (src_y + region.y1) * fb->pitches[0] +
++		     (src_x + region.x1) * 4;
++	src.pitch = fb->pitches[0];
++	src.width = drm_rect_width(&region);
++	src.height = drm_rect_height(&region);
++
++	/* The region in the buffer for the panel */
++	vop_rotation_image(vop->rot_buf[back], &dst);
++	dst.pitch = native->hdisplay * 4;
++	dst.width = src.height;
++	dst.height = src.width;
++	if (vop->rotation == 90)
++		dst.offset = region.x1 * dst.pitch + (height - region.y2) * 4;
++	else
++		dst.offset = (width - region.x2) * dst.pitch + region.y1 * 4;
++
++	ret = rockchip_rga1_rotate(vop->rga, &src, &dst, vop->rotation);
++	if (ret) {
++		DRM_DEV_ERROR_RATELIMITED(vop->dev, "rotation failed: %d\n",
++					  ret);
++		return;
++	}
++
++	drm_rect_init(&vop->rot_missing[back], 0, 0, 0, 0);
++	vop_rect_union(&vop->rot_missing[!back], &damage);
++	vop->rot_front = back;
++	vop->rot_valid = true;
++}
++
++/**
++ * rockchip_drm_vop_rotate_planes - rotate the framebuffers of a commit
++ * @state: the commit, from its commit tail
++ *
++ * Runs before the planes are updated. The previous commit on the CRTC has
++ * flipped, so the buffer that is not shown is free.
++ */
++void rockchip_drm_vop_rotate_planes(struct drm_atomic_commit *state)
++{
++	struct drm_plane_state *old_state;
++	struct drm_plane_state *new_state;
++	struct drm_crtc_state *crtc_state;
++	struct drm_plane *plane;
++	struct vop *vop;
++	int i;
++
++	for_each_oldnew_plane_in_state(state, plane, old_state, new_state, i) {
++		if (!new_state->crtc || new_state->crtc->funcs != &vop_crtc_funcs)
++			continue;
++
++		vop = to_vop(new_state->crtc);
++		if (!vop->rotation || plane->type != DRM_PLANE_TYPE_PRIMARY)
++			continue;
++
++		crtc_state = drm_atomic_get_new_crtc_state(state,
++							   new_state->crtc);
++		if (!crtc_state || !crtc_state->active ||
++		    !new_state->visible || !new_state->fb)
++			continue;
++
++		/* Unchanged framebuffer without damage: still up to date */
++		if (vop->rot_valid && new_state->fb == old_state->fb &&
++		    !new_state->fb_damage_clips &&
++		    !drm_atomic_crtc_needs_modeset(crtc_state))
++			continue;
++
++		vop_rotate_plane(vop, old_state, new_state, crtc_state);
++	}
++}
++
++/*
++ * The connectors of a rotated output report rotated modes: the panel bridge
++ * gets a copy of its helper functions with this get_modes().
++ */
++struct vop_rotated_connector {
++	struct drm_connector_helper_funcs funcs;
++	const struct drm_connector_helper_funcs *orig;
++};
++
++static int vop_rotated_get_modes(struct drm_connector *connector)
++{
++	const struct vop_rotated_connector *rotated =
++		container_of(connector->helper_private,
++			     struct vop_rotated_connector, funcs);
++	struct drm_display_info *info = &connector->display_info;
++	struct drm_display_mode *mode;
++	int count;
++
++	count = rotated->orig->get_modes(connector);
++
++	/* probed_modes only holds the modes of this probe */
++	list_for_each_entry(mode, &connector->probed_modes, head) {
++		vop_rotate_mode(mode);
++		drm_mode_set_name(mode);
++	}
++
++	swap(info->width_mm, info->height_mm);
++
++	return count;
++}
++
++static void vop_rotate_connector(struct drm_connector *connector)
++{
++	struct vop_rotated_connector *rotated;
++
++	if (!connector->helper_private ||
++	    !connector->helper_private->get_modes ||
++	    connector->helper_private->get_modes == vop_rotated_get_modes)
++		return;
++
++	rotated = drmm_kzalloc(connector->dev, sizeof(*rotated), GFP_KERNEL);
++	if (!rotated)
++		return;
++
++	rotated->orig = connector->helper_private;
++	rotated->funcs = *connector->helper_private;
++	rotated->funcs.get_modes = vop_rotated_get_modes;
++	connector->helper_private = &rotated->funcs;
++
++	DRM_DEV_INFO(connector->dev->dev, "%s: modes rotated\n",
++		     connector->name);
++}
++
++/**
++ * rockchip_drm_vop_rotation_init - rotate the modes of rotated outputs
++ * @drm: the DRM device, with all components bound
++ */
++void rockchip_drm_vop_rotation_init(struct drm_device *drm)
++{
++	struct drm_connector_list_iter iter;
++	struct drm_connector *connector;
++	struct drm_encoder *encoder;
++	struct drm_crtc *crtc;
++
++	drm_for_each_crtc(crtc, drm) {
++		if (crtc->funcs != &vop_crtc_funcs || !to_vop(crtc)->rotation)
++			continue;
++
++		drm_connector_list_iter_begin(drm, &iter);
++		drm_for_each_connector_iter(connector, &iter) {
++			drm_connector_for_each_possible_encoder(connector, encoder) {
++				if (encoder->possible_crtcs & drm_crtc_mask(crtc)) {
++					vop_rotate_connector(connector);
++					break;
++				}
++			}
++		}
++		drm_connector_list_iter_end(&iter);
++	}
++}
++
+ static void vop_win_init(struct vop *vop)
+ {
+ 	const struct vop_data *vop_data = vop->data;
+@@ -2238,6 +2686,10 @@
+ 	spin_lock_init(&vop->irq_lock);
+ 	mutex_init(&vop->vop_lock);
+ 
++	ret = vop_rotation_setup(vop);
++	if (ret)
++		return ret;
++
+ 	ret = vop_create_crtc(vop);
+ 	if (ret)
+ 		return ret;
+@@ -2283,6 +2735,7 @@
+ 
+ 	pm_runtime_disable(dev);
+ 	vop_destroy_crtc(vop);
++	vop_rotation_free(vop);
+ 
+ 	clk_unprepare(vop->aclk);
+ 	clk_unprepare(vop->hclk);
+--- a/drivers/gpu/drm/rockchip/rockchip_vop_reg.c
++++ b/drivers/gpu/drm/rockchip/rockchip_vop_reg.c
+@@ -15,6 +15,7 @@
+ 
+ #include "rockchip_drm_vop.h"
+ #include "rockchip_vop_reg.h"
++#include "rockchip_rga1.h"
+ #include "rockchip_drm_drv.h"
+ 
+ #define _VOP_REG(off, _mask, _shift, _write_mask, _relaxed) \
+@@ -1326,11 +1327,18 @@
+ {
+ 	struct device *dev = &pdev->dev;
+ 
++	struct rockchip_rga1 *rga;
++
+ 	if (!dev->of_node) {
+ 		DRM_DEV_ERROR(dev, "can't find vop devices\n");
+ 		return -ENODEV;
+ 	}
+ 
++	/* The RGA for output rotation has to be there before the bind */
++	rga = rockchip_rga1_get(dev);
++	if (IS_ERR(rga))
++		return PTR_ERR(rga);
++
+ 	return component_add(dev, &vop_component_ops);
+ }
+ 
+--- /dev/null
++++ b/drivers/gpu/drm/rockchip/rockchip_rga1.c
+@@ -0,0 +1,699 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * RGA (version 1) of the RK3126/RK3128: rotation of 32 bpp images by 90 or
++ * 270 degrees, for the VOP driver.
++ *
++ * The RGA fetches its register settings from a command buffer in memory.
++ * The command values for a rotating bitblt are calculated the way the
++ * Rockchip vendor driver does it (drivers/video/rockchip/rga, rga_reg_info.c
++ * and RGA_API.c): the destination is processed in 8x8 tiles, and a 2x2
++ * matrix maps every destination tile back into the source.
++ *
++ * Source and destination go through the MMU of the RGA, a flat table of
++ * 4 KiB page addresses.
++ */
++
++#include <linux/clk.h>
++#include <linux/completion.h>
++#include <linux/debugfs.h>
++#include <linux/delay.h>
++#include <linux/dma-mapping.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/ktime.h>
++#include <linux/math64.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/of_platform.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++
++#include "rockchip_drm_drv.h"
++#include "rockchip_rga1.h"
++
++#define RGA_SYS_CTRL			0x000
++#define RGA_SYS_CTRL_SOFT_RESET		BIT(0)
++#define RGA_SYS_CTRL_CMD_MODE		BIT(2)
++#define RGA_SYS_CTRL_MASTER_MODE	BIT(3)
++#define RGA_CMD_CTRL			0x004
++#define RGA_CMD_CTRL_START		BIT(0)
++#define RGA_CMD_ADDR			0x008
++#define RGA_STATUS			0x00c
++#define RGA_INT				0x010
++#define RGA_INT_ERROR			BIT(0)
++#define RGA_INT_MMU			BIT(1)
++#define RGA_INT_ALL_CMD_DONE		BIT(2)
++#define RGA_INT_CLEAR_ALL		(0xf << 4)
++#define RGA_INT_ERROR_EN		BIT(8)
++#define RGA_INT_MMU_EN			BIT(9)
++#define RGA_INT_ALL_CMD_DONE_EN		BIT(10)
++#define RGA_MMU_STA			0x01c
++#define RGA_VERSION			0x028
++
++/* The command buffer is loaded into the registers from 0x100 on */
++#define RGA_CMD_BASE			0x100
++#define RGA_CMD_WORDS			32
++
++/* Command buffer words: (register - RGA_CMD_BASE) / 4 */
++#define CMD_MODE_CTRL			(0x00 / 4)
++#define CMD_SRC_Y_MST			(0x04 / 4)
++#define CMD_SRC_VIR_INFO		(0x10 / 4)
++#define CMD_SRC_ACT_INFO		(0x14 / 4)
++#define CMD_SRC_X_PARA			(0x18 / 4)
++#define CMD_SRC_Y_PARA			(0x1c / 4)
++#define CMD_SRC_TILE_XINFO		(0x20 / 4)
++#define CMD_SRC_TILE_YINFO		(0x24 / 4)
++#define CMD_SRC_TILE_H_INCR		(0x28 / 4)
++#define CMD_SRC_TILE_V_INCR		(0x2c / 4)
++#define CMD_SRC_TILE_OFFSETX		(0x30 / 4)
++#define CMD_SRC_TILE_OFFSETY		(0x34 / 4)
++#define CMD_DST_MST			(0x4c / 4)
++#define CMD_DST_VIR_INFO		(0x50 / 4)
++#define CMD_DST_CTR_INFO		(0x54 / 4)
++#define CMD_ALPHA_CON			(0x58 / 4)
++#define CMD_MMU_CTRL			(0x68 / 4)
++#define CMD_MMU_TBL			(0x6c / 4)
++
++#define MODE_CTRL_ROTATE		(1 << 18)
++#define ALPHA_CON_GLOBAL_ALPHA(x)	((x) << 8)
++#define DST_CTR_INFO_FLAGS		(BIT(29) | BIT(28))
++#define MMU_CTRL_ENABLE			BIT(0)
++#define MMU_CTRL_FLUSH			(BIT(3) | BIT(2) | BIT(1))
++#define MMU_CTRL_PAGE_TABLE_SIZE(x)	((x) << 4)
++
++/* Room for the page table: 64 MiB of source and destination */
++#define RGA_TABLE_ENTRIES		16384
++/* Entries after source and destination that repeat their last page */
++#define RGA_TABLE_SPARE			16
++
++#define RGA_TIMEOUT_MS			500
++
++struct rockchip_rga1 {
++	struct device *dev;
++	void __iomem *regs;
++	struct clk_bulk_data *clks;
++	int num_clks;
++
++	/* serialises the jobs */
++	struct mutex lock;
++	struct completion done;
++	u32 int_status;
++
++	u32 *cmd;
++	dma_addr_t cmd_dma;
++	u32 *table;
++	dma_addr_t table_dma;
++
++	/* Statistics for debugfs, protected by lock */
++	u64 jobs;
++	u64 errors;
++	u64 total_us;
++	u64 total_pixels;
++	u32 max_us;
++	u32 last_us;
++};
++
++/* What the vendor driver calls TILE_INFO */
++struct rga1_tile {
++	s64 matrix[4];
++	s32 dst_x_tmp;
++	s32 dst_y_tmp;
++	s32 dst_w;
++	s32 dst_h;
++	s32 dst_x_off;
++	s32 dst_y_off;
++	s32 x_dx;
++	s32 x_dy;
++	s32 y_dx;
++	s32 y_dy;
++	s32 tile_xoff;
++	s32 tile_yoff;
++	u16 tile_w;
++	u16 tile_h;
++	s16 tile_start_x_coor;
++	s16 tile_start_y_coor;
++};
++
++/* A rotating bitblt in the terms of the vendor's struct rga_req */
++struct rga1_blit {
++	u32 src_addr;
++	u32 src_vir_w;
++	u32 src_vir_h;
++	u32 src_act_w;
++	u32 src_act_h;
++	u32 dst_addr;
++	u32 dst_vir_w;
++	u32 dst_vir_h;
++	u32 dst_act_w;
++	u32 dst_act_h;
++	s32 dst_x_offset;
++	s32 dst_y_offset;
++	s32 sina;
++	s32 cosa;
++};
++
++static s64 min4(s64 a, s64 b, s64 c, s64 d)
++{
++	return min(min(a, b), min(c, d));
++}
++
++static s64 max4(s64 a, s64 b, s64 c, s64 d)
++{
++	return max(max(a, b), max(c, d));
++}
++
++/* matrix_cal() for rotate_mode 1, without scaling */
++static void rga1_matrix_cal(const struct rga1_blit *b, struct rga1_tile *t)
++{
++	s64 x_time = 1 << 16;
++	s64 y_time = 1 << 16;
++
++	t->matrix[0] = b->cosa * x_time;
++	t->matrix[1] = -b->sina * y_time;
++	t->matrix[2] = b->sina * x_time;
++	t->matrix[3] = b->cosa * y_time;
++}
++
++/*
++ * dst_ctrl_cal() for rotate_mode 1 and 90 or 270 degrees, with the clip
++ * window set to the whole destination
++ */
++static void rga1_dst_ctrl_cal(const struct rga1_blit *b, struct rga1_tile *t)
++{
++	s32 w = b->dst_act_w;
++	s32 h = b->dst_act_h;
++	s32 xoff = b->dst_x_offset;
++	s32 yoff = b->dst_y_offset;
++	s32 pos[8];
++	s32 xmin;
++	s32 xmax;
++	s32 ymin;
++	s32 ymax;
++
++	if (b->sina > 0) {
++		/* 90 degrees: (xoff, yoff) is the top right corner */
++		pos[0] = xoff - h + 1;
++		pos[1] = yoff;
++		pos[2] = xoff - h + 1;
++		pos[3] = yoff + w - 1;
++		pos[4] = xoff;
++		pos[5] = yoff + w - 1;
++		pos[6] = xoff;
++		pos[7] = yoff;
++	} else {
++		/* 270 degrees: (xoff, yoff) is the bottom left corner */
++		pos[0] = xoff;
++		pos[1] = yoff - w + 1;
++		pos[2] = xoff;
++		pos[3] = yoff;
++		pos[4] = xoff + h - 1;
++		pos[5] = yoff;
++		pos[6] = xoff + h - 1;
++		pos[7] = yoff - w + 1;
++	}
++
++	xmax = min_t(s32, max4(pos[0], pos[2], pos[4], pos[6]), b->dst_vir_w - 1);
++	xmin = max_t(s32, min4(pos[0], pos[2], pos[4], pos[6]), 0);
++	ymax = min_t(s32, max4(pos[1], pos[3], pos[5], pos[7]), b->dst_vir_h - 1);
++	ymin = max_t(s32, min4(pos[1], pos[3], pos[5], pos[7]), 0);
++
++	t->dst_w = xmax - xmin;
++	t->dst_h = ymax - ymin;
++	t->dst_x_off = xmin;
++	t->dst_y_off = ymin;
++	t->dst_x_tmp = xmin - b->dst_x_offset;
++	t->dst_y_tmp = ymin - b->dst_y_offset;
++}
++
++/* src_tile_info_cal() for rotate_mode 1 */
++static void rga1_src_tile_info_cal(struct rga1_tile *t)
++{
++	s64 xx = t->matrix[0];
++	s64 xy = t->matrix[1];
++	s64 yx = t->matrix[2];
++	s64 yy = t->matrix[3];
++	s64 x0 = t->dst_x_tmp;
++	s64 y0 = t->dst_y_tmp;
++	s64 pos[8];
++	s64 epos[8];
++	s64 x_start;
++	s64 y_start;
++	s64 xmin;
++	s64 xmax;
++	s64 ymin;
++	s64 ymax;
++
++	/* Corners of the first 8x8 destination tile in the source */
++	pos[0] = x0 * xx + y0 * yx;
++	pos[1] = x0 * xy + y0 * yy;
++	pos[2] = x0 * xx + (y0 + 8) * yx;
++	pos[3] = x0 * xy + (y0 + 8) * yy;
++	pos[6] = (x0 + 8) * xx + y0 * yx;
++	pos[7] = (x0 + 8) * xy + y0 * yy;
++
++	epos[0] = pos[0];
++	epos[1] = pos[1];
++	epos[2] = x0 * xx + (y0 + 7) * yx;
++	epos[3] = x0 * xy + (y0 + 7) * yy;
++	epos[4] = (x0 + 7) * xx + (y0 + 7) * yx;
++	epos[5] = (x0 + 7) * xy + (y0 + 7) * yy;
++	epos[6] = (x0 + 7) * xx + y0 * yx;
++	epos[7] = (x0 + 7) * xy + y0 * yy;
++
++	t->x_dx = (s32)((pos[6] - pos[0]) >> 22);
++	t->x_dy = (s32)((pos[7] - pos[1]) >> 22);
++	t->y_dx = (s32)((pos[2] - pos[0]) >> 22);
++	t->y_dy = (s32)((pos[3] - pos[1]) >> 22);
++
++	x_start = x0 * xx + y0 * yx;
++	y_start = x0 * xy + y0 * yy;
++
++	xmax = max4(epos[0], epos[2], epos[4], epos[6]);
++	xmin = min4(epos[0], epos[2], epos[4], epos[6]);
++	ymax = max4(epos[1], epos[3], epos[5], epos[7]);
++	ymin = min4(epos[1], epos[3], epos[5], epos[7]);
++
++	t->tile_xoff = (s32)((x_start - xmin) >> 18);
++	t->tile_yoff = (s32)((y_start - ymin) >> 18);
++	t->tile_w = (u16)((xmax - xmin) >> 21);
++	t->tile_h = (u16)((ymax - ymin) >> 21);
++	t->tile_start_x_coor = (s16)(xmin >> 29);
++	t->tile_start_y_coor = (s16)(ymin >> 29);
++}
++
++/*
++ * The command buffer for a rotating bitblt from RGBA8888 to RGBA8888, which
++ * copies the 32 bits of every pixel unchanged
++ */
++static void rga1_gen_cmd(const struct rga1_blit *b, u32 table_dma, u32 *cmd)
++{
++	struct rga1_tile t = { };
++	u32 src_stride = b->src_vir_w * 4;
++	u32 dst_stride = b->dst_vir_w * 4;
++	u32 rop_mask_stride = (((b->src_vir_w + 7) >> 3) + 3) & ~3;
++	s32 m[4];
++	s32 pos[8];
++	s32 xmin;
++	s32 xmax;
++	s32 ymin;
++	s32 ymax;
++	s32 xp;
++	s32 yp;
++	int i;
++
++	memset(cmd, 0, RGA_CMD_WORDS * 4);
++
++	cmd[CMD_MODE_CTRL] = MODE_CTRL_ROTATE;
++	cmd[CMD_ALPHA_CON] = ALPHA_CON_GLOBAL_ALPHA(0xff);
++	cmd[CMD_SRC_VIR_INFO] = (src_stride >> 2) | (b->src_vir_h << 16);
++	cmd[CMD_SRC_ACT_INFO] = (b->src_act_w - 1) | ((b->src_act_h - 1) << 16);
++	cmd[CMD_DST_VIR_INFO] = ((dst_stride >> 2) & 0xffff) |
++				((rop_mask_stride >> 2) << 16);
++
++	rga1_matrix_cal(b, &t);
++	rga1_dst_ctrl_cal(b, &t);
++	rga1_src_tile_info_cal(&t);
++
++	for (i = 0; i < 4; i++)
++		m[i] = (s32)(t.matrix[i] >> 18);
++
++	cmd[CMD_SRC_X_PARA] = (m[0] & 0xffff) | (m[2] << 16);
++	cmd[CMD_SRC_Y_PARA] = (m[1] & 0xffff) | (m[3] << 16);
++	cmd[CMD_SRC_TILE_XINFO] = (t.tile_start_x_coor & 0xffff) | (t.tile_w << 16);
++	cmd[CMD_SRC_TILE_YINFO] = (t.tile_start_y_coor & 0xffff) | (t.tile_h << 16);
++	cmd[CMD_SRC_TILE_H_INCR] = (t.x_dx & 0xffff) | (t.x_dy << 16);
++	cmd[CMD_SRC_TILE_V_INCR] = (t.y_dx & 0xffff) | (t.y_dy << 16);
++	cmd[CMD_SRC_TILE_OFFSETX] = t.tile_xoff;
++	cmd[CMD_SRC_TILE_OFFSETY] = t.tile_yoff;
++
++	/* Source address of the first tile */
++	pos[0] = t.tile_start_x_coor << 8;
++	pos[1] = t.tile_start_y_coor << 8;
++	pos[2] = pos[0];
++	pos[3] = pos[1] + t.tile_h;
++	pos[4] = pos[0] + t.tile_w;
++	pos[5] = pos[1] + t.tile_h;
++	pos[6] = pos[0] + t.tile_w;
++	pos[7] = pos[1];
++
++	for (i = 0; i < 8; i++)
++		pos[i] >>= 11;
++
++	xmax = max4(pos[0], pos[2], pos[4], pos[6]) + 1;
++	xmin = min4(pos[0], pos[2], pos[4], pos[6]);
++	ymax = max4(pos[1], pos[3], pos[5], pos[7]) + 1;
++	ymin = min4(pos[1], pos[3], pos[5], pos[7]);
++
++	xp = xmin;
++	yp = ymin;
++	if (!(xmax < 0 || xmin > (s32)b->src_act_w - 1 ||
++	      ymax < 0 || ymin > (s32)b->src_act_h - 1)) {
++		xp = clamp_t(s32, xp, 0, b->src_act_w - 1);
++		yp = clamp_t(s32, yp, 0, b->src_act_h - 1);
++	}
++
++	cmd[CMD_SRC_Y_MST] = b->src_addr + yp * src_stride + xp * 4;
++	cmd[CMD_DST_MST] = b->dst_addr + t.dst_y_off * dst_stride + t.dst_x_off * 4;
++	cmd[CMD_DST_CTR_INFO] = t.dst_w | (t.dst_h << 16) | DST_CTR_INFO_FLAGS;
++
++	cmd[CMD_MMU_TBL] = table_dma >> 2;
++	cmd[CMD_MMU_CTRL] = MMU_CTRL_PAGE_TABLE_SIZE(2) | MMU_CTRL_FLUSH |
++			    MMU_CTRL_ENABLE;
++}
++
++/*
++ * Enter the pages of an image into the page table from @first on, followed
++ * by spare entries. Returns the number of entries used.
++ */
++static int rga1_map_image(struct rockchip_rga1 *rga,
++			  const struct rockchip_rga1_image *image,
++			  unsigned int first)
++{
++	unsigned int pages = DIV_ROUND_UP(image->size, PAGE_SIZE);
++	unsigned int i = 0;
++	struct sg_page_iter iter;
++
++	if (first + pages + RGA_TABLE_SPARE > RGA_TABLE_ENTRIES)
++		return -E2BIG;
++
++	if (image->sgt) {
++		for_each_sgtable_page(image->sgt, &iter, 0) {
++			if (i == pages)
++				break;
++
++			rga->table[first + i] = page_to_phys(sg_page_iter_page(&iter));
++			i++;
++		}
++
++		if (i < pages)
++			return -EINVAL;
++	} else {
++		for (i = 0; i < pages; i++)
++			rga->table[first + i] = image->phys + i * PAGE_SIZE;
++	}
++
++	for (i = 0; i < RGA_TABLE_SPARE; i++)
++		rga->table[first + pages + i] = rga->table[first + pages - 1];
++
++	return pages + RGA_TABLE_SPARE;
++}
++
++static bool rga1_image_fits(const struct rockchip_rga1_image *image)
++{
++	u64 end = image->offset + (u64)image->pitch * (image->height - 1) +
++		  image->width * 4;
++
++	return image->width && image->height && image->pitch % 4 == 0 &&
++	       image->pitch >= image->width * 4 && end <= image->size;
++}
++
++static void rga1_soft_reset(struct rockchip_rga1 *rga)
++{
++	int i;
++
++	writel(RGA_SYS_CTRL_SOFT_RESET, rga->regs + RGA_SYS_CTRL);
++
++	for (i = 0; i < 1000; i++) {
++		if (!(readl(rga->regs + RGA_SYS_CTRL) & RGA_SYS_CTRL_SOFT_RESET))
++			break;
++
++		udelay(1);
++	}
++}
++
++/**
++ * rockchip_rga1_rotate - rotate a 32 bpp image
++ * @rga: the RGA
++ * @src: source image
++ * @dst: destination image, @src->height wide and @src->width high
++ * @degrees: 90 or 270, clockwise
++ *
++ * Sleeps until the RGA has finished.
++ */
++int rockchip_rga1_rotate(struct rockchip_rga1 *rga,
++			 const struct rockchip_rga1_image *src,
++			 const struct rockchip_rga1_image *dst,
++			 unsigned int degrees)
++{
++	struct rga1_blit b = { };
++	unsigned long timeout;
++	ktime_t start;
++	s64 elapsed;
++	int src_entries;
++	int dst_entries;
++	u32 status;
++	int ret;
++
++	if (degrees != 90 && degrees != 270)
++		return -EINVAL;
++
++	if (!rga1_image_fits(src) || !rga1_image_fits(dst) ||
++	    dst->width != src->height || dst->height != src->width)
++		return -EINVAL;
++
++	mutex_lock(&rga->lock);
++
++	src_entries = rga1_map_image(rga, src, 0);
++	if (src_entries < 0) {
++		ret = src_entries;
++		goto out_unlock;
++	}
++
++	dst_entries = rga1_map_image(rga, dst, src_entries);
++	if (dst_entries < 0) {
++		ret = dst_entries;
++		goto out_unlock;
++	}
++
++	b.src_addr = src->offset;
++	b.src_vir_w = src->pitch / 4;
++	b.src_vir_h = src->height;
++	b.src_act_w = src->width;
++	b.src_act_h = src->height;
++	b.dst_addr = (src_entries << PAGE_SHIFT) + dst->offset;
++	b.dst_vir_w = dst->pitch / 4;
++	b.dst_vir_h = dst->height;
++	b.dst_act_w = src->width;
++	b.dst_act_h = src->height;
++	b.cosa = 0;
++
++	if (degrees == 90) {
++		b.sina = 65536;
++		b.dst_x_offset = dst->width - 1;
++		b.dst_y_offset = 0;
++	} else {
++		b.sina = -65536;
++		b.dst_x_offset = 0;
++		b.dst_y_offset = dst->height - 1;
++	}
++
++	rga1_gen_cmd(&b, rga->table_dma, rga->cmd);
++
++	ret = pm_runtime_resume_and_get(rga->dev);
++	if (ret < 0)
++		goto out_unlock;
++
++	ret = clk_bulk_prepare_enable(rga->num_clks, rga->clks);
++	if (ret)
++		goto out_put;
++
++	rga1_soft_reset(rga);
++	writel(0, rga->regs + RGA_SYS_CTRL);
++
++	/*
++	 * Like the vendor driver: clear the MMU control register before the
++	 * command buffer sets it again, otherwise the MMU keeps translations
++	 * of the previous job and faults.
++	 */
++	writel(0, rga->regs + RGA_CMD_BASE + CMD_MMU_CTRL * 4);
++
++	writel(rga->cmd_dma, rga->regs + RGA_CMD_ADDR);
++	writel(RGA_SYS_CTRL_CMD_MODE | RGA_SYS_CTRL_MASTER_MODE,
++	       rga->regs + RGA_SYS_CTRL);
++	writel(readl(rga->regs + RGA_INT) | RGA_INT_ALL_CMD_DONE_EN |
++	       RGA_INT_MMU_EN | RGA_INT_ERROR_EN, rga->regs + RGA_INT);
++
++	rga->int_status = 0;
++	reinit_completion(&rga->done);
++	start = ktime_get();
++	writel(RGA_CMD_CTRL_START, rga->regs + RGA_CMD_CTRL);
++
++	timeout = wait_for_completion_timeout(&rga->done,
++					      msecs_to_jiffies(RGA_TIMEOUT_MS));
++	status = rga->int_status;
++	elapsed = ktime_us_delta(ktime_get(), start);
++
++	if (!timeout) {
++		dev_err_ratelimited(rga->dev, "timeout, INT %08x STATUS %08x\n",
++				    readl(rga->regs + RGA_INT),
++				    readl(rga->regs + RGA_STATUS));
++		ret = -ETIMEDOUT;
++	} else if (status & (RGA_INT_ERROR | RGA_INT_MMU)) {
++		dev_err_ratelimited(rga->dev, "error, INT %08x MMU %08x\n",
++				    status, readl(rga->regs + RGA_MMU_STA));
++		ret = -EIO;
++	}
++
++	if (ret) {
++		rga1_soft_reset(rga);
++		rga->errors++;
++	} else {
++		rga->jobs++;
++		rga->total_us += elapsed;
++		rga->total_pixels += src->width * src->height;
++		rga->last_us = elapsed;
++		rga->max_us = max_t(u32, rga->max_us, elapsed);
++	}
++
++	clk_bulk_disable_unprepare(rga->num_clks, rga->clks);
++
++out_put:
++	pm_runtime_put(rga->dev);
++out_unlock:
++	mutex_unlock(&rga->lock);
++	return ret;
++}
++
++static int rga1_stats_show(struct seq_file *m, void *data)
++{
++	struct rockchip_rga1 *rga = m->private;
++
++	mutex_lock(&rga->lock);
++	seq_printf(m, "jobs %llu errors %llu average_us %llu average_pixels %llu max_us %u last_us %u\n",
++		   rga->jobs, rga->errors,
++		   rga->jobs ? div64_u64(rga->total_us, rga->jobs) : 0,
++		   rga->jobs ? div64_u64(rga->total_pixels, rga->jobs) : 0,
++		   rga->max_us, rga->last_us);
++	mutex_unlock(&rga->lock);
++
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(rga1_stats);
++
++static irqreturn_t rga1_irq(int irq, void *data)
++{
++	struct rockchip_rga1 *rga = data;
++	u32 status = readl(rga->regs + RGA_INT);
++
++	if (!(status & (RGA_INT_ALL_CMD_DONE | RGA_INT_MMU | RGA_INT_ERROR)))
++		return IRQ_NONE;
++
++	writel(status | RGA_INT_CLEAR_ALL, rga->regs + RGA_INT);
++	rga->int_status = status;
++	complete(&rga->done);
++
++	return IRQ_HANDLED;
++}
++
++/**
++ * rockchip_rga1_get - the RGA that the "rockchip,rga" property of a device
++ *		       points to
++ * @dev: the device
++ *
++ * Returns NULL without the property, ERR_PTR(-EPROBE_DEFER) while the RGA
++ * is not probed yet.
++ */
++struct rockchip_rga1 *rockchip_rga1_get(struct device *dev)
++{
++	struct device_node *np;
++	struct platform_device *pdev;
++	struct rockchip_rga1 *rga;
++
++	np = of_parse_phandle(dev->of_node, "rockchip,rga", 0);
++	if (!np)
++		return NULL;
++
++	pdev = of_find_device_by_node(np);
++	of_node_put(np);
++	if (!pdev)
++		return ERR_PTR(-EPROBE_DEFER);
++
++	rga = platform_get_drvdata(pdev);
++	put_device(&pdev->dev);
++	if (!rga)
++		return ERR_PTR(-EPROBE_DEFER);
++
++	return rga;
++}
++
++static int rga1_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct rockchip_rga1 *rga;
++	int irq;
++	int ret;
++
++	rga = devm_kzalloc(dev, sizeof(*rga), GFP_KERNEL);
++	if (!rga)
++		return -ENOMEM;
++
++	rga->dev = dev;
++	mutex_init(&rga->lock);
++	init_completion(&rga->done);
++
++	rga->regs = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(rga->regs))
++		return PTR_ERR(rga->regs);
++
++	rga->num_clks = devm_clk_bulk_get_all(dev, &rga->clks);
++	if (rga->num_clks < 0)
++		return dev_err_probe(dev, rga->num_clks, "no clocks\n");
++
++	irq = platform_get_irq(pdev, 0);
++	if (irq < 0)
++		return irq;
++
++	ret = devm_request_irq(dev, irq, rga1_irq, 0, dev_name(dev), rga);
++	if (ret)
++		return ret;
++
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
++	if (ret)
++		return ret;
++
++	rga->cmd = dmam_alloc_coherent(dev, RGA_CMD_WORDS * 4, &rga->cmd_dma,
++				       GFP_KERNEL);
++	rga->table = dmam_alloc_coherent(dev, RGA_TABLE_ENTRIES * 4,
++					 &rga->table_dma, GFP_KERNEL);
++	if (!rga->cmd || !rga->table)
++		return -ENOMEM;
++
++	ret = devm_pm_runtime_enable(dev);
++	if (ret)
++		return ret;
++
++	ret = pm_runtime_resume_and_get(dev);
++	if (ret < 0)
++		return ret;
++
++	ret = clk_bulk_prepare_enable(rga->num_clks, rga->clks);
++	if (ret) {
++		pm_runtime_put(dev);
++		return ret;
++	}
++
++	dev_info(dev, "RGA version %08x\n", readl(rga->regs + RGA_VERSION));
++
++	clk_bulk_disable_unprepare(rga->num_clks, rga->clks);
++	pm_runtime_put(dev);
++
++	debugfs_create_file("rockchip-rga1", 0444, NULL, rga, &rga1_stats_fops);
++
++	platform_set_drvdata(pdev, rga);
++	return 0;
++}
++
++static const struct of_device_id rga1_dt_ids[] = {
++	{ .compatible = "rockchip,rk3128-rga" },
++	{ /* sentinel */ },
++};
++
++struct platform_driver rockchip_rga1_driver = {
++	.probe = rga1_probe,
++	.driver = {
++		.name = "rockchip-rga1",
++		.of_match_table = rga1_dt_ids,
++		.suppress_bind_attrs = true,
++	},
++};
+--- /dev/null
++++ b/drivers/gpu/drm/rockchip/rockchip_rga1.h
+@@ -0,0 +1,51 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * RGA (version 1) of the RK3126/RK3128, used by the VOP driver to rotate
++ * the output for panels that are mounted rotated.
++ */
++
++#ifndef _ROCKCHIP_RGA1_H
++#define _ROCKCHIP_RGA1_H
++
++#include <linux/device.h>
++#include <linux/scatterlist.h>
++
++struct rockchip_rga1;
++
++/*
++ * A 32 bit per pixel image. The RGA reads and writes it through its own MMU,
++ * so the buffer does not need to be contiguous: @sgt lists its pages. Without
++ * @sgt, the buffer is contiguous and starts at the physical address @phys.
++ */
++struct rockchip_rga1_image {
++	struct sg_table *sgt;
++	phys_addr_t phys;
++	size_t size;
++	unsigned int offset;
++	unsigned int pitch;
++	unsigned int width;
++	unsigned int height;
++};
++
++#if IS_ENABLED(CONFIG_ROCKCHIP_VOP)
++struct rockchip_rga1 *rockchip_rga1_get(struct device *dev);
++int rockchip_rga1_rotate(struct rockchip_rga1 *rga,
++			 const struct rockchip_rga1_image *src,
++			 const struct rockchip_rga1_image *dst,
++			 unsigned int degrees);
++#else
++static inline struct rockchip_rga1 *rockchip_rga1_get(struct device *dev)
++{
++	return NULL;
++}
++
++static inline int rockchip_rga1_rotate(struct rockchip_rga1 *rga,
++				       const struct rockchip_rga1_image *src,
++				       const struct rockchip_rga1_image *dst,
++				       unsigned int degrees)
++{
++	return -ENODEV;
++}
++#endif
++
++#endif /* _ROCKCHIP_RGA1_H */

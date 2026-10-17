@@ -518,10 +518,33 @@
 		power-domains = <&power RK3128_PD_VIO>;
 		#iommu-cells = <0>;
 	};
+
+	/*
+	 * RGA (version 1, 2D blitter), missing in rk3128.dtsi. Interrupt and
+	 * clocks as in the stock device tree ("rockchip,rk312x-rga").
+	 */
+	rga: rga@1010c000 {
+		compatible = "rockchip,rk3128-rga";
+		reg = <0x1010c000 0x1000>;
+		interrupts = <GIC_SPI 44 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&cru ACLK_RGA>, <&cru HCLK_RGA>;
+		clock-names = "aclk", "hclk";
+		power-domains = <&power RK3128_PD_VIO>;
+	};
 };
 
+/*
+ * The panel is portrait (800x1280), the frame hangs landscape. With
+ * rockchipdrm.rga_rotation=1 on the kernel command line, the VOP driver
+ * reports 1280x800 modes and the RGA rotates every frame by 90 degrees
+ * clockwise into the panel's orientation (kernel patch 0006); the
+ * compositor must then not rotate (no wlr-randr --transform). Off by
+ * default: the GPU rotates a full frame faster than the RGA.
+ */
 &vop {
 	iommus = <&vop_mmu>;
+	rockchip,rga = <&rga>;
+	rockchip,output-rotation = <90>;
 	status = "okay";
 };
 
