@@ -73,6 +73,16 @@ gadget_start()
 	done
 
 	echo "$udc" > UDC
+
+	# The port is dual-role: put it in device mode for the gadget. Host
+	# mode is switched by hand (see the device tree).
+	for role in /sys/class/usb_role/*/role
+	do
+		if [ -e "$role" ]
+		then
+			echo device > "$role"
+		fi
+	done
 }
 
 gadget_stop()

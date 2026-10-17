@@ -26,7 +26,7 @@ Clean, mainline Debian Linux image (similar to Raspberry Pi OS) for the Denver F
 - X11 and Wayland support
 - WiFi (RK915, 2.4GHz only, ~25 MBit/s throughput)
 - Dynamic frequency scaling (idle support, reduces power consumption)
-- USB peripheral mode
+- USB peripheral mode, USB host mode (switched by hand, experimental)
 - MicroSD and eMMC support
 - Hardware video decoding (Hantro VPU: H.264 up to 1080p at ~30 fps, VP8, MPEG-2) through the V4L2 stateless decoder API, e.g. GStreamer `v4l2slh264dec` (not installed by default, not used by Chromium)
 
@@ -35,7 +35,7 @@ Clean, mainline Debian Linux image (similar to Raspberry Pi OS) for the Denver F
 SD card performance is severely limited (~2 MByte/s) because the SD card shares some pins with the UART serial interface.
 This causes the SD card to only run in 1-bit mode.
 
-Internal eMMC can reach about 40 MByte/s (reading).
+Internal eMMC can reach about 60 MByte/s reading and 50 MByte/s writing (DDR52 mode).
 
 The CPU and GPU performance is comparable to a Raspberry Pi 2.
 
@@ -83,10 +83,25 @@ The picture frame has full USB peripheral support and will expose itself as a US
 [2573973.617019] cdc_ether 1-3:1.2 enx02524b313237: renamed from usb0
 ```
 
+# USB host mode (experimental)
+
+The USB-C port starts in device mode (serial console and Ethernet, see above).
+It can be switched to host mode by hand, and back:
+
+```
+echo host > /sys/class/usb_role/10180000.usb-role-switch/role
+echo device > /sys/class/usb_role/10180000.usb-role-switch/role
+```
+
+The frame cannot supply power to the attached device: VBUS of the USB-C port is only its power input.
+The device needs 5V from the same power supply as the frame, e.g. through an OTG Y-cable with a power input,
+or a USB hub fed by the same supply.
+The warnings about the USB-C port above (orientation, signal integrity) apply in host mode as well.
+
 # Possible future improvements (not yet supported)
 
 - Audio support
-- USB host mode (e.g. wired Ethernet, storage, keyboard/mice, etc.) -- would pair well with a cheap USB-C PoE adapter!
+- USB host mode tested with real devices (e.g. wired Ethernet, storage, keyboard/mice, etc.) -- would pair well with a cheap USB-C PoE adapter!
 
 # Internals/PCBs
 

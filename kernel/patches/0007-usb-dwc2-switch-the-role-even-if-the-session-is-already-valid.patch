@@ -1,0 +1,30 @@
+From: picture-frame build
+Subject: [PATCH] usb: dwc2: switch the role even if the session is already valid
+
+The role switch only forces the controller into the new mode if it had
+to change the A or B session override. On the frame, VBUS of the USB-C
+port is the power input, so the PHY reports both sessions as valid: the
+override helpers return -EALREADY, the mode is never forced, and writing
+"host" to the role switch leaves the controller in device mode.
+
+Force the mode also when the controller is not in the requested mode.
+dwc2_force_mode() can be called again for the current mode.
+---
+diff --git a/drivers/usb/dwc2/drd.c b/drivers/usb/dwc2/drd.c
+--- a/drivers/usb/dwc2/drd.c
++++ b/drivers/usb/dwc2/drd.c
+@@ -156,7 +156,13 @@
+ 
+ 	spin_unlock_irqrestore(&hsotg->lock, flags);
+ 
+-	if (!already && hsotg->dr_mode == USB_DR_MODE_OTG)
++	/*
++	 * A session that is already valid does not mean that the controller
++	 * is in the requested mode: with VBUS present on the port, both the A
++	 * and the B session are valid, whatever the role.
++	 */
++	if (hsotg->dr_mode == USB_DR_MODE_OTG &&
++	    (!already || dwc2_is_host_mode(hsotg) != (role == USB_ROLE_HOST)))
+ 		/* This will raise a Connector ID Status Change Interrupt */
+ 		dwc2_force_mode(hsotg, role == USB_ROLE_HOST);
+ 

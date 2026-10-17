@@ -503,8 +503,22 @@
 	status = "okay";
 };
 
+/*
+ * The USB-C port has no ID pin and no CC logic, and its VBUS is the power
+ * input of the frame. It starts in device mode (USB gadget, see
+ * usb-gadget); host mode is switched in software:
+ *
+ *   echo host > /sys/class/usb_role/10180000.usb-role-switch/role
+ *
+ * The role switch overrides the session signals of the controller, so it
+ * needs neither an ID pin nor VBUS detection. The attached device needs
+ * VBUS from the frame's power supply (OTG Y-cable or a hub fed by the same
+ * supply): the frame cannot output it.
+ */
 &usb_otg {
-	dr_mode = "peripheral";
+	dr_mode = "otg";
+	usb-role-switch;
+	role-switch-default-mode = "peripheral";
 	status = "okay";
 };
 
