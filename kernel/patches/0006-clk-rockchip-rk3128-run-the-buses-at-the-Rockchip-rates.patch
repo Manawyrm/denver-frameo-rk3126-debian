@@ -1,0 +1,57 @@
+From: picture-frame build
+Subject: [PATCH] clk: rockchip: rk3128: run the buses at the Rockchip rates
+
+The boot loaders leave the CPU bus at 49.5 MHz (aclk_cpu, hclk_cpu) and
+the peripheral bus at 74.25 MHz (aclk_peri, hclk_peri); mainline never
+changes them. The Rockchip kernel runs both at aclk 300 MHz, hclk
+150 MHz and pclk 75 MHz, the worst-case limits of the RK3126C datasheet.
+Set GPLL/2, /4 and /8 (297, 148.5 and 74.25 MHz) before the clocks are
+registered, raising the hclk and pclk dividers before their source.
+
+The PL330 that moves the data of all three SD/MMC controllers runs on
+aclk_peri. With the eMMC in DDR52 mode it used to abort 76 to 99
+transfers while reading all package files once; at the new rates 0 to 1.
+Register reads on the peripheral buses take 162 instead of 230 ns.
+---
+diff --git a/drivers/clk/rockchip/clk-rk3128.c b/drivers/clk/rockchip/clk-rk3128.c
+--- a/drivers/clk/rockchip/clk-rk3128.c
++++ b/drivers/clk/rockchip/clk-rk3128.c
+@@ -587,6 +587,29 @@
+ 	dsb();
+ }
+ 
++/*
++ * The boot loaders leave the CPU and peripheral buses slow (aclk_cpu
++ * 49.5 MHz, aclk_peri and hclk_peri 74.25 MHz). Run them like the Rockchip
++ * kernel: aclk 297 MHz, hclk 148.5 MHz, pclk 74.25 MHz, which is GPLL/2,
++ * /4 and /8 and within the worst-case limits of the datasheet. The hclk
++ * and pclk dividers follow the aclk source, so they are raised first;
++ * this way no bus clock ever runs faster than its final rate. Done before
++ * the clocks are registered, so that the clock tree reads the new
++ * dividers.
++ */
++static void __init rk3128_bus_clk_init(void __iomem *reg_base)
++{
++	/* hclk_cpu = aclk_cpu_src / 2, pclk_cpu = aclk_cpu_src / 4 */
++	writel(HIWORD_UPDATE(0x31, 0x73, 8), reg_base + RK2928_CLKSEL_CON(1));
++	/* aclk_cpu_src = GPLL / 2 */
++	writel(HIWORD_UPDATE(0x21, 0x7f, 8), reg_base + RK2928_CLKSEL_CON(0));
++
++	/* hclk_peri = aclk_peri / 2, pclk_peri = aclk_peri / 4 */
++	writel(HIWORD_UPDATE(0x21, 0x33, 8), reg_base + RK2928_CLKSEL_CON(10));
++	/* clk_peri_src = GPLL / 2 */
++	writel(HIWORD_UPDATE(0x01, 0xc01f, 0), reg_base + RK2928_CLKSEL_CON(10));
++}
++
+ static struct rockchip_clk_provider *__init rk3128_common_clk_init(struct device_node *np,
+ 								   unsigned long soc_nr_clks)
+ {
+@@ -602,6 +625,8 @@
+ 		return ERR_PTR(-ENOMEM);
+ 	}
+ 
++	rk3128_bus_clk_init(reg_base);
++
+ 	ctx = rockchip_clk_init(np, reg_base, max(common_nr_clks, soc_nr_clks));
+ 	if (IS_ERR(ctx)) {
+ 		pr_err("%s: rockchip clk init failed\n", __func__);
